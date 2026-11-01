@@ -17,9 +17,14 @@ API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MAX_RISK_USD = 50.0
-MAX_DAILY_LOSS_USD = -100.0  # Daily account circuit breaker
+MAX_DAILY_LOSS_USD = -100.0
 TARGET_MULT = 1.5
-WATCHLIST = ["NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR", "COIN", "SMCI"]
+
+# High-liquidity universe to screen dynamically each morning
+SCREENER_POOL = [
+    "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR",
+    "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU"
+]
 
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL:
@@ -43,7 +48,6 @@ def send_alert(title, message, color=3066993):
         pass
 
 def calculate_vwap(df):
-    """Calculates intraday VWAP from bar data."""
     try:
         typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
         cum_vol_price = (typical_price * df["Volume"]).cumsum()
@@ -53,9 +57,47 @@ def calculate_vwap(df):
     except Exception:
         return None
 
+def get_dynamic_watchlist(pool):
+    """Screens universe for active pre-market gappers (1.5% - 8.0%)."""
+    print("🔎 Running Dynamic Watchlist Screener (Pre-Market Gap & RVOL)...")
+    active_candidates = []
+    
+    for sym in pool:
+        try:
+            ticker = yf.Ticker(sym)
+            hist = ticker.history(period="5d", interval="1d")
+            if len(hist) < 2:
+                continue
+            prev_close = float(hist["Close"].iloc[-2])
+            
+            # Intraday data
+            intra = ticker.history(period="1d", interval="5m", prepost=True)
+            if intra.empty:
+                continue
+            current_price = float(intra["Close"].iloc[-1])
+            gap_pct = ((current_price - prev_close) / prev_close) * 100
+            
+            # Filter: Gapping up between 1.5% and 8%
+            if 1.5 <= gap_pct <= 8.0:
+                active_candidates.append((sym, gap_pct))
+                print(f"   • {sym}: Active Gap +{gap_pct:.2f}% ✅")
+        except Exception:
+            continue
+            
+    active_candidates.sort(key=lambda x: x[1], reverse=True)
+    selected = [sym for sym, _ in active_candidates[:5]]
+    
+    # Fallback to liquid leaders if no stocks are gapping within bounds
+    if not selected:
+        print("   • No active gappers found within 1.5%-8.0%. Defaulting to core liquid basket.")
+        selected = ["NVDA", "TSLA", "PLTR", "AMD"]
+        
+    print(f"📋 Final Dynamic Watchlist for Today: {selected}")
+    return selected
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# --- UPGRADE 1: ACCOUNT CIRCUIT BREAKER ---
+# 1. Circuit Breaker
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
     account = trading_client.get_account()
@@ -72,7 +114,7 @@ try:
 except Exception as e:
     print(f"⚠️ Circuit breaker check warning: {e}. Proceeding.")
 
-# Market Breadth Filter (QQQ)
+# 2. Market Breadth Filter (QQQ)
 print("🔍 Checking US Market Sentiment (QQQ)...")
 try:
     qqq = yf.Ticker("QQQ").history(period="2d", interval="5m")
@@ -89,8 +131,11 @@ try:
 except Exception as e:
     print(f"⚠️ Index check warning: {e}. Proceeding.")
 
-# 15m Candle Breakout Scanner + UPGRADE 3: VWAP FILTER
-print("🔍 Scanning tech basket with 15m Confirmation & VWAP filter...")
+# 3. Dynamic Watchlist Generation
+WATCHLIST = get_dynamic_watchlist(SCREENER_POOL)
+
+# 4. 15m Candle Breakout Scanner + VWAP
+print("🔍 Scanning dynamic basket for 15m breakout & VWAP alignment...")
 try:
     data = yf.download(WATCHLIST, period="2d", interval="5m", progress=False, group_by="ticker")
 except Exception as e:
@@ -100,7 +145,7 @@ except Exception as e:
 candidates = []
 for symbol in WATCHLIST:
     try:
-        df = data[symbol].dropna()
+        df = data[symbol].dropna() if len(WATCHLIST) > 1 else data.dropna()
         if len(df) < 4:
             continue
         orb_high = float(df["High"].iloc[:3].max())
@@ -108,10 +153,8 @@ for symbol in WATCHLIST:
         current_price = float(df["Close"].iloc[-1])
         vol_opening = float(df["Volume"].iloc[:3].sum())
         
-        # Calculate VWAP
         vwap_val = calculate_vwap(df)
 
-        # Candidate must break 15m high AND trade above VWAP
         if current_price > orb_high:
             if vwap_val and current_price < vwap_val:
                 print(f"   ⚠️ {symbol} broke ORB High (${orb_high:.2f}) but is BELOW VWAP (${vwap_val:.2f}). Dropped.")
@@ -153,7 +196,7 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# Submit Bracket Order
+# 5. Submit Bracket Order
 req = MarketOrderRequest(
     symbol=symbol,
     qty=shares,
@@ -171,7 +214,7 @@ print(f"   • Entry: ${current_price:.2f} | VWAP: ${best['vwap']} | SL: ${stop_
 alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price:.2f}\n**VWAP:** ${best['vwap']}\n**Stop Loss:** ${stop_price:.2f}\n**Take Profit:** ${target_price:.2f}\n**Max Risk:** -${total_risk:.2f} USD"
 send_alert(f"🚀 Cloud US Trade Executed: {symbol}", alert_msg, color=3066993)
 
-# Trailing Stop to Breakeven (+1R)
+# 6. Trailing Stop to Breakeven (+1R)
 print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
