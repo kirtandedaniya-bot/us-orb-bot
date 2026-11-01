@@ -2,11 +2,23 @@ name: US Automated ORB Session
 
 on:
   schedule:
+    # 15:16 UTC = 11:16 PM AWST (Market Open Scan)
     - cron: '16 15 * * 1-5'
+    # 21:05 UTC = 05:05 AM AWST (Market Close Recap)
+    - cron: '5 21 * * 1-5'
   workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose job to run'
+        required: true
+        default: 'trade'
+        type: choice
+        options:
+          - trade
+          - recap
 
 jobs:
-  trade:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,9 +30,14 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install alpaca-py yfinance openpyxl pytz
-      - name: Execute US ORB Engine
+      - name: Execute Script
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python bot.py
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "recap" ] || [ "$(date -u +%H)" = "21" ]; then
+            python eod_recap.py
+          else
+            python bot.py
+          fi
