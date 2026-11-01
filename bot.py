@@ -42,11 +42,20 @@ def send_alert(title, message, color=3066993):
     except Exception:
         pass
 
+def calculate_vwap(df):
+    """Calculates intraday VWAP from bar data."""
+    try:
+        typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
+        cum_vol_price = (typical_price * df["Volume"]).cumsum()
+        cum_volume = df["Volume"].cumsum()
+        vwap_series = cum_vol_price / cum_volume
+        return float(vwap_series.iloc[-1])
+    except Exception:
+        return None
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# ==========================================
-# UPGRADE 1: ACCOUNT CIRCUIT BREAKER
-# ==========================================
+# --- UPGRADE 1: ACCOUNT CIRCUIT BREAKER ---
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
     account = trading_client.get_account()
@@ -63,7 +72,7 @@ try:
 except Exception as e:
     print(f"⚠️ Circuit breaker check warning: {e}. Proceeding.")
 
-# 1. Market Breadth Filter (QQQ)
+# Market Breadth Filter (QQQ)
 print("🔍 Checking US Market Sentiment (QQQ)...")
 try:
     qqq = yf.Ticker("QQQ").history(period="2d", interval="5m")
@@ -80,8 +89,8 @@ try:
 except Exception as e:
     print(f"⚠️ Index check warning: {e}. Proceeding.")
 
-# 2. Candle Confirmation Scanner (15m Opening Range)
-print("🔍 Scanning tech basket for confirmed 15m breakout...")
+# 15m Candle Breakout Scanner + UPGRADE 3: VWAP FILTER
+print("🔍 Scanning tech basket with 15m Confirmation & VWAP filter...")
 try:
     data = yf.download(WATCHLIST, period="2d", interval="5m", progress=False, group_by="ticker")
 except Exception as e:
@@ -98,8 +107,16 @@ for symbol in WATCHLIST:
         orb_low = float(df["Low"].iloc[:3].min())
         current_price = float(df["Close"].iloc[-1])
         vol_opening = float(df["Volume"].iloc[:3].sum())
+        
+        # Calculate VWAP
+        vwap_val = calculate_vwap(df)
 
+        # Candidate must break 15m high AND trade above VWAP
         if current_price > orb_high:
+            if vwap_val and current_price < vwap_val:
+                print(f"   ⚠️ {symbol} broke ORB High (${orb_high:.2f}) but is BELOW VWAP (${vwap_val:.2f}). Dropped.")
+                continue
+
             pct_gain = ((current_price - orb_low) / orb_low) * 100
             score = (vol_opening / 100000.0) * pct_gain
             candidates.append({
@@ -107,6 +124,7 @@ for symbol in WATCHLIST:
                 "current_price": round(current_price, 2),
                 "orb_high": round(orb_high, 2),
                 "orb_low": round(orb_low, 2),
+                "vwap": round(vwap_val, 2) if vwap_val else "N/A",
                 "pct": pct_gain,
                 "score": score
             })
@@ -114,7 +132,7 @@ for symbol in WATCHLIST:
         continue
 
 if not candidates:
-    print("⚠️ No valid 15m candle breakouts confirmed. Skipping execution.")
+    print("⚠️ No valid breakouts meeting 15m + VWAP criteria. Skipping execution.")
     sys.exit(0)
 
 candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -135,7 +153,7 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# 3. Submit Native Broker Bracket
+# Submit Bracket Order
 req = MarketOrderRequest(
     symbol=symbol,
     qty=shares,
@@ -148,12 +166,12 @@ req = MarketOrderRequest(
 
 order = trading_client.submit_order(req)
 print(f"✅ Submitted Native Alpaca Bracket for {shares} shares of {symbol}:")
-print(f"   • Entry: ${current_price:.2f} | SL: ${stop_price:.2f} | TP: ${target_price:.2f} | Risk: -${total_risk:.2f}")
+print(f"   • Entry: ${current_price:.2f} | VWAP: ${best['vwap']} | SL: ${stop_price:.2f} | TP: ${target_price:.2f} | Risk: -${total_risk:.2f}")
 
-alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price:.2f}\n**Stop Loss:** ${stop_price:.2f}\n**Take Profit:** ${target_price:.2f}\n**Max Risk:** -${total_risk:.2f} USD"
+alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price:.2f}\n**VWAP:** ${best['vwap']}\n**Stop Loss:** ${stop_price:.2f}\n**Take Profit:** ${target_price:.2f}\n**Max Risk:** -${total_risk:.2f} USD"
 send_alert(f"🚀 Cloud US Trade Executed: {symbol}", alert_msg, color=3066993)
 
-# 4. Trailing Stop to Breakeven (+1R)
+# Trailing Stop to Breakeven (+1R)
 print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
