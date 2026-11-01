@@ -6,6 +6,7 @@ import urllib.request
 import warnings
 from datetime import datetime
 import pytz
+import numpy as np
 import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import StopLimitOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
@@ -35,7 +36,7 @@ def send_alert(title, message, color=3066993):
             "title": title,
             "description": message,
             "color": color,
-            "footer": {"text": "Cloud US ORB Engine • Stop-Limit Precision"}
+            "footer": {"text": "Cloud US ORB Engine • ATR Volatility Dynamic"}
         }]
     }
     req = urllib.request.Request(
@@ -55,6 +56,22 @@ def calculate_vwap(df):
         cum_volume = df["Volume"].cumsum()
         vwap_series = cum_vol_price / cum_volume
         return float(vwap_series.iloc[-1])
+    except Exception:
+        return None
+
+def calculate_atr(df, period=14):
+    """Calculates Average True Range over 5-minute bars."""
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"].shift(1)
+        tr1 = high - low
+        tr2 = (high - close).abs()
+        tr3 = (low - close).abs()
+        tr = np.maximum(tr1, np.maximum(tr2, tr3))
+        atr = tr.rolling(window=period).mean()
+        val = float(atr.iloc[-1])
+        return val if not np.isnan(val) else None
     except Exception:
         return None
 
@@ -144,7 +161,7 @@ def get_dynamic_watchlist(pool):
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# 1. Account Circuit Breaker
+# 1. Circuit Breaker
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
     account = trading_client.get_account()
@@ -181,10 +198,10 @@ except Exception as e:
 # 3. Dynamic Watchlist Generation
 WATCHLIST = get_dynamic_watchlist(SCREENER_POOL)
 
-# 4. 15m Breakout Scanner + VWAP
-print("🔍 Scanning dynamic basket for 15m breakout & VWAP alignment...")
+# 4. 15m Breakout Scanner + VWAP & ATR
+print("🔍 Scanning dynamic basket for 15m breakout, VWAP & ATR calculation...")
 try:
-    data = yf.download(WATCHLIST, period="2d", interval="5m", progress=False, group_by="ticker")
+    data = yf.download(WATCHLIST, period="5d", interval="5m", progress=False, group_by="ticker")
 except Exception as e:
     print(f"❌ Failed to download scanner data: {e}")
     sys.exit(1)
@@ -193,14 +210,15 @@ candidates = []
 for symbol in WATCHLIST:
     try:
         df = data[symbol].dropna() if len(WATCHLIST) > 1 else data.dropna()
-        if len(df) < 4:
+        if len(df) < 15:
             continue
-        orb_high = float(df["High"].iloc[:3].max())
-        orb_low = float(df["Low"].iloc[:3].min())
+        orb_high = float(df["High"].iloc[-4:-1].max())
+        orb_low = float(df["Low"].iloc[-4:-1].min())
         current_price = float(df["Close"].iloc[-1])
-        vol_opening = float(df["Volume"].iloc[:3].sum())
+        vol_opening = float(df["Volume"].iloc[-4:-1].sum())
         
         vwap_val = calculate_vwap(df)
+        atr_val = calculate_atr(df, period=14)
 
         if current_price > orb_high:
             if vwap_val and current_price < vwap_val:
@@ -215,6 +233,7 @@ for symbol in WATCHLIST:
                 "orb_high": round(orb_high, 2),
                 "orb_low": round(orb_low, 2),
                 "vwap": round(vwap_val, 2) if vwap_val else "N/A",
+                "atr": round(atr_val, 2) if atr_val else round(current_price * 0.015, 2),
                 "pct": pct_gain,
                 "score": score
             })
@@ -229,7 +248,7 @@ candidates.sort(key=lambda x: x["score"], reverse=True)
 best = candidates[0]
 symbol = best["symbol"]
 current_price = best["current_price"]
-stop_price = round(best["orb_low"], 2)
+atr = best["atr"]
 
 # 5. Gemini AI Catalyst Sentiment Check
 approved, ai_score, ai_reason = analyze_sentiment_with_ai(symbol)
@@ -239,11 +258,21 @@ if not approved:
     send_alert(f"🛑 AI Suppressed Setup: {symbol}", msg, color=15158332)
     sys.exit(0)
 
-risk_per_share = round(current_price - stop_price, 2)
-if risk_per_share <= 0.20 or risk_per_share > (current_price * 0.04):
-    risk_per_share = round(current_price * 0.02, 2)
-    stop_price = round(current_price - risk_per_share, 2)
+# ==============================================================
+# UPGRADE 2: ATR-BASED DYNAMIC VOLATILITY SIZING
+# ==============================================================
+candle_risk = round(current_price - best["orb_low"], 2)
+atr_risk = round(1.5 * atr, 2)
 
+# Dynamic stop distance takes the maximum of candle structure or 1.5x ATR
+risk_per_share = round(max(candle_risk, atr_risk), 2)
+
+# Safety bounds: risk between 0.3% and 3.5% of share price
+min_bound = round(current_price * 0.003, 2)
+max_bound = round(current_price * 0.035, 2)
+risk_per_share = max(min_bound, min(risk_per_share, max_bound))
+
+stop_price = round(current_price - risk_per_share, 2)
 shares = int(MAX_RISK_USD // risk_per_share)
 if shares < 1:
     shares = 1
@@ -251,11 +280,8 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# ==============================================================
-# UPGRADE 1: STOP-LIMIT BRACKET ORDER (SLIPPAGE DEFENSE)
-# ==============================================================
+# Slippage protection limits
 stop_trigger_price = round(best["orb_high"] + 0.01, 2)
-# Limit ceiling allows max 10% of risk distance for fill (prevents paying huge premiums)
 limit_ceiling_price = round(stop_trigger_price + max(0.05, risk_per_share * 0.10), 2)
 
 req = StopLimitOrderRequest(
@@ -271,25 +297,26 @@ req = StopLimitOrderRequest(
 )
 
 order = trading_client.submit_order(req)
-print(f"✅ Submitted Native Alpaca Precision Stop-Limit Bracket for {shares} shares of {symbol}:")
-print(f"   • Stop Trigger: ${stop_trigger_price:.2f} | Limit Cap: ${limit_ceiling_price:.2f}")
+print(f"✅ Submitted Native Alpaca ATR-Volatility Bracket for {shares} shares of {symbol}:")
+print(f"   • Entry: ${current_price:.2f} | ATR(14): ${atr:.2f} | Risk/sh: ${risk_per_share:.2f}")
 print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} | Max Risk: -${total_risk:.2f}")
 
 alert_msg = (
     f"**Ticker:** {symbol}\n"
     f"**Shares:** {shares}\n"
-    f"**Order Type:** Stop-Limit Bracket (Slippage Protected)\n"
+    f"**Order Type:** Stop-Limit Bracket (ATR Normalized)\n"
     f"**Trigger Price:** ${stop_trigger_price:.2f}\n"
     f"**Max Limit Fill:** ${limit_ceiling_price:.2f}\n"
+    f"**ATR (14):** ${atr:.2f}\n"
     f"**VWAP:** ${best['vwap']}\n"
     f"**Stop Loss:** ${stop_price:.2f}\n"
     f"**Take Profit:** ${target_price:.2f}\n"
     f"**Max Risk:** -${total_risk:.2f} USD\n\n"
     f"🧠 **AI Catalyst Analysis ({ai_score}/10):**\n*{ai_reason}*"
 )
-send_alert(f"🚀 Cloud US Stop-Limit Placed: {symbol}", alert_msg, color=3066993)
+send_alert(f"🚀 Cloud US ATR Bracket Placed: {symbol}", alert_msg, color=3066993)
 
-# 7. Trailing Stop to Breakeven (+1R)
+# Trailing Stop to Breakeven (+1R)
 print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
