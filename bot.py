@@ -28,6 +28,23 @@ SCREENER_POOL = [
     "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU"
 ]
 
+# High-impact US macro event dates (FOMC Rate Decisions, CPI Releases, NFP)
+MACRO_BLACKOUT_DATES = {
+    # 2026 FOMC Decision Days (2:00 PM ET)
+    "2026-01-28": "FOMC Rate Decision",
+    "2026-03-18": "FOMC Rate Decision & Projections",
+    "2026-04-29": "FOMC Rate Decision",
+    "2026-06-17": "FOMC Rate Decision & Projections",
+    "2026-07-29": "FOMC Rate Decision",
+    "2026-09-16": "FOMC Rate Decision & Projections",
+    "2026-10-28": "FOMC Rate Decision",
+    "2026-12-09": "FOMC Rate Decision & Projections",
+    # 2026 Key CPI Release Days (8:30 AM ET)
+    "2026-11-10": "US CPI Inflation Release",
+    "2026-12-10": "US CPI Inflation Release",
+    "2027-01-13": "US CPI Inflation Release"
+}
+
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL:
         return
@@ -36,7 +53,7 @@ def send_alert(title, message, color=3066993):
             "title": title,
             "description": message,
             "color": color,
-            "footer": {"text": "Cloud US ORB Engine • ATR Volatility Dynamic"}
+            "footer": {"text": "Cloud US ORB Engine • Macro Risk Blackout"}
         }]
     }
     req = urllib.request.Request(
@@ -49,6 +66,18 @@ def send_alert(title, message, color=3066993):
     except Exception:
         pass
 
+def check_macro_blackout():
+    """Checks if today is a scheduled high-impact macro risk day."""
+    eastern = pytz.timezone("US/Eastern")
+    today_et = datetime.now(eastern).strftime("%Y-%m-%d")
+    if today_et in MACRO_BLACKOUT_DATES:
+        event_name = MACRO_BLACKOUT_DATES[today_et]
+        msg = f"Trading suppressed: Today ({today_et}) is a scheduled high-impact macro event ({event_name}). Capital preserved."
+        print(f"🛑 MACRO RISK BLACKOUT: {msg}")
+        send_alert("⚠️ Macro Event Blackout Activated", msg, color=15844367)
+        return True
+    return False
+
 def calculate_vwap(df):
     try:
         typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
@@ -60,7 +89,6 @@ def calculate_vwap(df):
         return None
 
 def calculate_atr(df, period=14):
-    """Calculates Average True Range over 5-minute bars."""
     try:
         high = df["High"]
         low = df["Low"]
@@ -161,6 +189,12 @@ def get_dynamic_watchlist(pool):
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
+# ==============================================================
+# UPGRADE 3: MACRO ECONOMIC BLACKOUT GATE
+# ==============================================================
+if check_macro_blackout():
+    sys.exit(0)
+
 # 1. Circuit Breaker
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
@@ -171,7 +205,7 @@ try:
     print(f"   • Today's Account P&L: ${daily_pl:+.2f} USD")
     
     if daily_pl <= MAX_DAILY_LOSS_USD:
-        msg = f"Account daily loss threshold breached (${daily_pl:.2f} <= ${MAX_DAILY_LOSS_USD:.2f}). Trading halted for the day."
+        msg = f"Account daily loss threshold breached (${daily_pl:.2f} <=${MAX_DAILY_LOSS_USD:.2f}). Trading halted for the day."
         print(f"🛑 CIRCUIT BREAKER TRIPPED: {msg}")
         send_alert("🚨 US Account Circuit Breaker Triggered", msg, color=15158332)
         sys.exit(0)
@@ -258,16 +292,11 @@ if not approved:
     send_alert(f"🛑 AI Suppressed Setup: {symbol}", msg, color=15158332)
     sys.exit(0)
 
-# ==============================================================
-# UPGRADE 2: ATR-BASED DYNAMIC VOLATILITY SIZING
-# ==============================================================
+# ATR Dynamic Volatility Sizing
 candle_risk = round(current_price - best["orb_low"], 2)
 atr_risk = round(1.5 * atr, 2)
-
-# Dynamic stop distance takes the maximum of candle structure or 1.5x ATR
 risk_per_share = round(max(candle_risk, atr_risk), 2)
 
-# Safety bounds: risk between 0.3% and 3.5% of share price
 min_bound = round(current_price * 0.003, 2)
 max_bound = round(current_price * 0.035, 2)
 risk_per_share = max(min_bound, min(risk_per_share, max_bound))
@@ -280,7 +309,7 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# Slippage protection limits
+# Stop-Limit Bracket with Slippage Guard
 stop_trigger_price = round(best["orb_high"] + 0.01, 2)
 limit_ceiling_price = round(stop_trigger_price + max(0.05, risk_per_share * 0.10), 2)
 
@@ -298,13 +327,13 @@ req = StopLimitOrderRequest(
 
 order = trading_client.submit_order(req)
 print(f"✅ Submitted Native Alpaca ATR-Volatility Bracket for {shares} shares of {symbol}:")
-print(f"   • Entry: ${current_price:.2f} | ATR(14): ${atr:.2f} | Risk/sh: ${risk_per_share:.2f}")
-print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} | Max Risk: -${total_risk:.2f}")
+print(f"   • Entry: ${current_price:.2f} | ATR(14): ${atr:.2f} \vert{} Risk/sh:${risk_per_share:.2f}")
+print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} \vert{} Max Risk: -${total_risk:.2f}")
 
 alert_msg = (
     f"**Ticker:** {symbol}\n"
     f"**Shares:** {shares}\n"
-    f"**Order Type:** Stop-Limit Bracket (ATR Normalized)\n"
+    f"**Order Type:** Stop-Limit Bracket (ATR & Macro Guarded)\n"
     f"**Trigger Price:** ${stop_trigger_price:.2f}\n"
     f"**Max Limit Fill:** ${limit_ceiling_price:.2f}\n"
     f"**ATR (14):** ${atr:.2f}\n"
@@ -331,7 +360,7 @@ for _ in range(30):
             if sl_order:
                 trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=current_price))
                 print(f"🔒 Breakeven Triggered: Stop moved to ${current_price:.2f}.")
-                send_alert(f"🛡️ {symbol} Breakeven Activated", f"Price hit ${quote:.2f} (+1R).\nStop Loss raised to ${current_price:.2f}.", color=15844367)
+                send_alert(f"🛡️ {symbol} Breakeven Activated", f"Price hit ${quote:.2f} (+1R).\nStop Loss raised to${current_price:.2f}.", color=15844367)
                 be_set = True
                 break
     except Exception:
