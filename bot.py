@@ -17,6 +17,7 @@ API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MAX_RISK_USD = 50.0
+MAX_DAILY_LOSS_USD = -100.0  # Daily account circuit breaker
 TARGET_MULT = 1.5
 WATCHLIST = ["NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR", "COIN", "SMCI"]
 
@@ -42,6 +43,25 @@ def send_alert(title, message, color=3066993):
         pass
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+
+# ==========================================
+# UPGRADE 1: ACCOUNT CIRCUIT BREAKER
+# ==========================================
+print("🛡️ Checking daily account P&L circuit breaker...")
+try:
+    account = trading_client.get_account()
+    equity_now = float(account.equity)
+    equity_open = float(account.last_equity)
+    daily_pl = equity_now - equity_open
+    print(f"   • Today's Account P&L: ${daily_pl:+.2f} USD")
+    
+    if daily_pl <= MAX_DAILY_LOSS_USD:
+        msg = f"Account daily loss threshold breached (${daily_pl:.2f} <= ${MAX_DAILY_LOSS_USD:.2f}). Trading halted for the day."
+        print(f"🛑 CIRCUIT BREAKER TRIPPED: {msg}")
+        send_alert("🚨 US Account Circuit Breaker Triggered", msg, color=15158332)
+        sys.exit(0)
+except Exception as e:
+    print(f"⚠️ Circuit breaker check warning: {e}. Proceeding.")
 
 # 1. Market Breadth Filter (QQQ)
 print("🔍 Checking US Market Sentiment (QQQ)...")
