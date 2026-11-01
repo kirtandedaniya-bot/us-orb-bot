@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 import yfinance as yf
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca.trading.requests import StopLimitOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 warnings.filterwarnings("ignore")
@@ -16,11 +16,12 @@ warnings.filterwarnings("ignore")
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
 MAX_RISK_USD = 50.0
 MAX_DAILY_LOSS_USD = -100.0
 TARGET_MULT = 1.5
 
-# High-liquidity universe to screen dynamically each morning
 SCREENER_POOL = [
     "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR",
     "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU"
@@ -34,7 +35,7 @@ def send_alert(title, message, color=3066993):
             "title": title,
             "description": message,
             "color": color,
-            "footer": {"text": "Cloud US ORB Engine"}
+            "footer": {"text": "Cloud US ORB Engine • Stop-Limit Precision"}
         }]
     }
     req = urllib.request.Request(
@@ -57,8 +58,57 @@ def calculate_vwap(df):
     except Exception:
         return None
 
+def analyze_sentiment_with_ai(symbol):
+    if not GEMINI_API_KEY:
+        print("⚠️ GEMINI_API_KEY not set. Bypassing AI news filter.")
+        return True, 7, "No Gemini API key provided (Bypassed)."
+
+    print(f"🤖 Querying Gemini AI for catalyst sentiment on {symbol}...")
+    try:
+        ticker = yf.Ticker(symbol)
+        news = ticker.news or []
+        headlines = [n.get("title", "") for n in news[:5] if "title" in n]
+
+        if not headlines:
+            print("   • No breaking headlines found. Neutral clearance.")
+            return True, 6, "No recent news headlines found."
+
+        prompt = f"""You are an institutional momentum risk manager.
+Analyze these recent market headlines for {symbol} to decide if a LONG breakout trade should proceed:
+{json.dumps(headlines)}
+
+Rules:
+- Give a score from 1 to 10 (1 = extremely hostile/dilution/scandal, 5 = neutral, 10 = massive positive earnings beat/catalyst).
+- Provide a concise 10-word justification.
+- Respond ONLY with valid, raw JSON in this format:
+{{"score": 8, "reason": "Strong earnings follow-through and analyst upgrades supporting upside momentum."}}"""
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        req_body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"response_mime_type": "application/json"}
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(req_body).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            parsed = json.loads(raw_text)
+            
+            score = int(parsed.get("score", 5))
+            reason = str(parsed.get("reason", "No reason provided."))
+
+            print(f"   • AI Score: {score}/10 | Analysis: {reason}")
+            return (score >= 6), score, reason
+    except Exception as e:
+        print(f"⚠️ AI sentiment check error: {e}. Bypassing safely.")
+        return True, 5, f"Check bypassed due to exception: {e}"
+
 def get_dynamic_watchlist(pool):
-    """Screens universe for active pre-market gappers (1.5% - 8.0%)."""
     print("🔎 Running Dynamic Watchlist Screener (Pre-Market Gap & RVOL)...")
     active_candidates = []
     
@@ -70,14 +120,12 @@ def get_dynamic_watchlist(pool):
                 continue
             prev_close = float(hist["Close"].iloc[-2])
             
-            # Intraday data
             intra = ticker.history(period="1d", interval="5m", prepost=True)
             if intra.empty:
                 continue
             current_price = float(intra["Close"].iloc[-1])
             gap_pct = ((current_price - prev_close) / prev_close) * 100
             
-            # Filter: Gapping up between 1.5% and 8%
             if 1.5 <= gap_pct <= 8.0:
                 active_candidates.append((sym, gap_pct))
                 print(f"   • {sym}: Active Gap +{gap_pct:.2f}% ✅")
@@ -87,17 +135,16 @@ def get_dynamic_watchlist(pool):
     active_candidates.sort(key=lambda x: x[1], reverse=True)
     selected = [sym for sym, _ in active_candidates[:5]]
     
-    # Fallback to liquid leaders if no stocks are gapping within bounds
     if not selected:
         print("   • No active gappers found within 1.5%-8.0%. Defaulting to core liquid basket.")
         selected = ["NVDA", "TSLA", "PLTR", "AMD"]
         
-    print(f"📋 Final Dynamic Watchlist for Today: {selected}")
+    print(f"📋 Final Dynamic Watchlist: {selected}")
     return selected
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# 1. Circuit Breaker
+# 1. Account Circuit Breaker
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
     account = trading_client.get_account()
@@ -134,7 +181,7 @@ except Exception as e:
 # 3. Dynamic Watchlist Generation
 WATCHLIST = get_dynamic_watchlist(SCREENER_POOL)
 
-# 4. 15m Candle Breakout Scanner + VWAP
+# 4. 15m Breakout Scanner + VWAP
 print("🔍 Scanning dynamic basket for 15m breakout & VWAP alignment...")
 try:
     data = yf.download(WATCHLIST, period="2d", interval="5m", progress=False, group_by="ticker")
@@ -184,6 +231,14 @@ symbol = best["symbol"]
 current_price = best["current_price"]
 stop_price = round(best["orb_low"], 2)
 
+# 5. Gemini AI Catalyst Sentiment Check
+approved, ai_score, ai_reason = analyze_sentiment_with_ai(symbol)
+if not approved:
+    msg = f"Trade rejected by AI News Gate (Score: {ai_score}/10).\nReason: {ai_reason}"
+    print(f"🛑 {msg}")
+    send_alert(f"🛑 AI Suppressed Setup: {symbol}", msg, color=15158332)
+    sys.exit(0)
+
 risk_per_share = round(current_price - stop_price, 2)
 if risk_per_share <= 0.20 or risk_per_share > (current_price * 0.04):
     risk_per_share = round(current_price * 0.02, 2)
@@ -196,25 +251,45 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# 5. Submit Bracket Order
-req = MarketOrderRequest(
+# ==============================================================
+# UPGRADE 1: STOP-LIMIT BRACKET ORDER (SLIPPAGE DEFENSE)
+# ==============================================================
+stop_trigger_price = round(best["orb_high"] + 0.01, 2)
+# Limit ceiling allows max 10% of risk distance for fill (prevents paying huge premiums)
+limit_ceiling_price = round(stop_trigger_price + max(0.05, risk_per_share * 0.10), 2)
+
+req = StopLimitOrderRequest(
     symbol=symbol,
     qty=shares,
     side=OrderSide.BUY,
     time_in_force=TimeInForce.GTC,
     order_class=OrderClass.BRACKET,
+    stop_price=stop_trigger_price,
+    limit_price=limit_ceiling_price,
     take_profit=TakeProfitRequest(limit_price=target_price),
     stop_loss=StopLossRequest(stop_price=stop_price)
 )
 
 order = trading_client.submit_order(req)
-print(f"✅ Submitted Native Alpaca Bracket for {shares} shares of {symbol}:")
-print(f"   • Entry: ${current_price:.2f} | VWAP: ${best['vwap']} | SL: ${stop_price:.2f} | TP: ${target_price:.2f} | Risk: -${total_risk:.2f}")
+print(f"✅ Submitted Native Alpaca Precision Stop-Limit Bracket for {shares} shares of {symbol}:")
+print(f"   • Stop Trigger: ${stop_trigger_price:.2f} | Limit Cap: ${limit_ceiling_price:.2f}")
+print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} | Max Risk: -${total_risk:.2f}")
 
-alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price:.2f}\n**VWAP:** ${best['vwap']}\n**Stop Loss:** ${stop_price:.2f}\n**Take Profit:** ${target_price:.2f}\n**Max Risk:** -${total_risk:.2f} USD"
-send_alert(f"🚀 Cloud US Trade Executed: {symbol}", alert_msg, color=3066993)
+alert_msg = (
+    f"**Ticker:** {symbol}\n"
+    f"**Shares:** {shares}\n"
+    f"**Order Type:** Stop-Limit Bracket (Slippage Protected)\n"
+    f"**Trigger Price:** ${stop_trigger_price:.2f}\n"
+    f"**Max Limit Fill:** ${limit_ceiling_price:.2f}\n"
+    f"**VWAP:** ${best['vwap']}\n"
+    f"**Stop Loss:** ${stop_price:.2f}\n"
+    f"**Take Profit:** ${target_price:.2f}\n"
+    f"**Max Risk:** -${total_risk:.2f} USD\n\n"
+    f"🧠 **AI Catalyst Analysis ({ai_score}/10):**\n*{ai_reason}*"
+)
+send_alert(f"🚀 Cloud US Stop-Limit Placed: {symbol}", alert_msg, color=3066993)
 
-# 6. Trailing Stop to Breakeven (+1R)
+# 7. Trailing Stop to Breakeven (+1R)
 print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
