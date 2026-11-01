@@ -18,19 +18,22 @@ API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 MAX_RISK_USD = 50.0
 MAX_DAILY_LOSS_USD = -100.0
 TARGET_MULT = 1.5
 
-SCREENER_POOL = [
+# Institutional high-momentum universe dynamically scanned each morning
+EXPANDED_MARKET_UNIVERSE = [
     "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR",
-    "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU"
+    "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU",
+    "MARA", "RIOT", "HOOD", "AFRM", "SOFI", "DKNG", "UBER", "MSTR",
+    "RIVN", "LCID", "BABA", "BIDU", "PDD", "NIO", "XPEV", "LI",
+    "CRWD", "PANW", "NET", "SNOW", "DDOG", "ZS", "MDB", "PATH"
 ]
 
-# High-impact US macro event dates (FOMC Rate Decisions, CPI Releases, NFP)
 MACRO_BLACKOUT_DATES = {
-    # 2026 FOMC Decision Days (2:00 PM ET)
     "2026-01-28": "FOMC Rate Decision",
     "2026-03-18": "FOMC Rate Decision & Projections",
     "2026-04-29": "FOMC Rate Decision",
@@ -39,7 +42,6 @@ MACRO_BLACKOUT_DATES = {
     "2026-09-16": "FOMC Rate Decision & Projections",
     "2026-10-28": "FOMC Rate Decision",
     "2026-12-09": "FOMC Rate Decision & Projections",
-    # 2026 Key CPI Release Days (8:30 AM ET)
     "2026-11-10": "US CPI Inflation Release",
     "2026-12-10": "US CPI Inflation Release",
     "2027-01-13": "US CPI Inflation Release"
@@ -53,7 +55,7 @@ def send_alert(title, message, color=3066993):
             "title": title,
             "description": message,
             "color": color,
-            "footer": {"text": "Cloud US ORB Engine • Macro Risk Blackout"}
+            "footer": {"text": "Cloud US ORB Engine • Market-Wide Precision"}
         }]
     }
     req = urllib.request.Request(
@@ -67,7 +69,6 @@ def send_alert(title, message, color=3066993):
         pass
 
 def check_macro_blackout():
-    """Checks if today is a scheduled high-impact macro risk day."""
     eastern = pytz.timezone("US/Eastern")
     today_et = datetime.now(eastern).strftime("%Y-%m-%d")
     if today_et in MACRO_BLACKOUT_DATES:
@@ -103,23 +104,55 @@ def calculate_atr(df, period=14):
     except Exception:
         return None
 
+def fetch_multi_source_headlines(symbol):
+    headlines = []
+    try:
+        ticker = yf.Ticker(symbol)
+        yf_news = ticker.news or []
+        for item in yf_news[:4]:
+            t = item.get("title")
+            if t:
+                headlines.append(f"[Yahoo] {t.strip()}")
+    except Exception:
+        pass
+
+    if FINNHUB_API_KEY:
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={today_str}&to={today_str}&token={FINNHUB_API_KEY}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                fh_items = json.loads(resp.read().decode("utf-8"))
+                for item in fh_items[:4]:
+                    headline = item.get("headline")
+                    if headline:
+                        headlines.append(f"[Finnhub] {headline.strip()}")
+        except Exception as e:
+            print(f"⚠️ Finnhub wire note: {e}")
+
+    seen = set()
+    deduped = []
+    for h in headlines:
+        core_text = h.split("] ", 1)[-1].lower()
+        if core_text not in seen:
+            seen.add(core_text)
+            deduped.append(h)
+    return deduped[:6]
+
 def analyze_sentiment_with_ai(symbol):
     if not GEMINI_API_KEY:
         print("⚠️ GEMINI_API_KEY not set. Bypassing AI news filter.")
         return True, 7, "No Gemini API key provided (Bypassed)."
 
-    print(f"🤖 Querying Gemini AI for catalyst sentiment on {symbol}...")
+    print(f"🤖 Querying Gemini AI across multi-source financial wires for {symbol}...")
     try:
-        ticker = yf.Ticker(symbol)
-        news = ticker.news or []
-        headlines = [n.get("title", "") for n in news[:5] if "title" in n]
-
+        headlines = fetch_multi_source_headlines(symbol)
         if not headlines:
-            print("   • No breaking headlines found. Neutral clearance.")
+            print("   • No breaking headlines found across Yahoo or Finnhub. Neutral clearance.")
             return True, 6, "No recent news headlines found."
 
         prompt = f"""You are an institutional momentum risk manager.
-Analyze these recent market headlines for {symbol} to decide if a LONG breakout trade should proceed:
+Analyze these multi-source market headlines (Yahoo & Finnhub wires) for {symbol} to decide if a LONG breakout trade should proceed:
 {json.dumps(headlines)}
 
 Rules:
@@ -143,59 +176,59 @@ Rules:
             res_data = json.loads(response.read().decode("utf-8"))
             raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
             parsed = json.loads(raw_text)
-            
             score = int(parsed.get("score", 5))
             reason = str(parsed.get("reason", "No reason provided."))
 
-            print(f"   • AI Score: {score}/10 | Analysis: {reason}")
+            print(f"   • Multi-Source AI Score: {score}/10 | Analysis: {reason}")
             return (score >= 6), score, reason
     except Exception as e:
-        print(f"⚠️ AI sentiment check error: {e}. Bypassing safely.")
+        print(f"⚠️ Multi-source AI sentiment error: {e}. Bypassing safely.")
         return True, 5, f"Check bypassed due to exception: {e}"
 
-def get_dynamic_watchlist(pool):
-    print("🔎 Running Dynamic Watchlist Screener (Pre-Market Gap & RVOL)...")
+def get_market_wide_dynamic_watchlist(pool):
+    """Screens the expanded universe for the top 5 highest-quality pre-market gappers (1.5% - 8.0%)."""
+    print(f"🔎 Running Market-Wide Screener across {len(pool)} high-beta tickers...")
     active_candidates = []
     
-    for sym in pool:
-        try:
-            ticker = yf.Ticker(sym)
-            hist = ticker.history(period="5d", interval="1d")
-            if len(hist) < 2:
+    try:
+        # Fast bulk download of daily data to measure gaps
+        daily_df = yf.download(pool, period="5d", interval="1d", progress=False)
+        closes = daily_df["Close"]
+        
+        for sym in pool:
+            try:
+                sym_closes = closes[sym].dropna()
+                if len(sym_closes) < 2:
+                    continue
+                prev_close = float(sym_closes.iloc[-2])
+                last_price = float(sym_closes.iloc[-1])
+                gap_pct = ((last_price - prev_close) / prev_close) * 100
+                
+                # Check price range ($15 - $500) and gap range (+1.5% to +8.0%)
+                if 15.0 <= last_price <= 500.0 and 1.5 <= gap_pct <= 8.0:
+                    active_candidates.append((sym, gap_pct))
+            except Exception:
                 continue
-            prev_close = float(hist["Close"].iloc[-2])
-            
-            intra = ticker.history(period="1d", interval="5m", prepost=True)
-            if intra.empty:
-                continue
-            current_price = float(intra["Close"].iloc[-1])
-            gap_pct = ((current_price - prev_close) / prev_close) * 100
-            
-            if 1.5 <= gap_pct <= 8.0:
-                active_candidates.append((sym, gap_pct))
-                print(f"   • {sym}: Active Gap +{gap_pct:.2f}% ✅")
-        except Exception:
-            continue
-            
+    except Exception as e:
+        print(f"⚠️ Bulk screener note: {e}")
+
     active_candidates.sort(key=lambda x: x[1], reverse=True)
     selected = [sym for sym, _ in active_candidates[:5]]
     
     if not selected:
-        print("   • No active gappers found within 1.5%-8.0%. Defaulting to core liquid basket.")
-        selected = ["NVDA", "TSLA", "PLTR", "AMD"]
+        print("   • No active gappers within bounds. Defaulting to high-volume institutional basket.")
+        selected = ["NVDA", "TSLA", "PLTR", "AMD", "META"]
         
-    print(f"📋 Final Dynamic Watchlist: {selected}")
+    print(f"📋 Selected Top 5 Dynamic Leaders for Today: {selected}")
     return selected
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# ==============================================================
-# UPGRADE 3: MACRO ECONOMIC BLACKOUT GATE
-# ==============================================================
+# 1. Macro Blackout Check
 if check_macro_blackout():
     sys.exit(0)
 
-# 1. Circuit Breaker
+# 2. Account Circuit Breaker
 print("🛡️ Checking daily account P&L circuit breaker...")
 try:
     account = trading_client.get_account()
@@ -205,14 +238,14 @@ try:
     print(f"   • Today's Account P&L: ${daily_pl:+.2f} USD")
     
     if daily_pl <= MAX_DAILY_LOSS_USD:
-        msg = f"Account daily loss threshold breached (${daily_pl:.2f} <=${MAX_DAILY_LOSS_USD:.2f}). Trading halted for the day."
+        msg = f"Account daily loss threshold breached (${daily_pl:.2f} <= ${MAX_DAILY_LOSS_USD:.2f}). Trading halted for the day."
         print(f"🛑 CIRCUIT BREAKER TRIPPED: {msg}")
         send_alert("🚨 US Account Circuit Breaker Triggered", msg, color=15158332)
         sys.exit(0)
 except Exception as e:
     print(f"⚠️ Circuit breaker check warning: {e}. Proceeding.")
 
-# 2. Market Breadth Filter (QQQ)
+# 3. Market Breadth Filter (QQQ)
 print("🔍 Checking US Market Sentiment (QQQ)...")
 try:
     qqq = yf.Ticker("QQQ").history(period="2d", interval="5m")
@@ -229,11 +262,11 @@ try:
 except Exception as e:
     print(f"⚠️ Index check warning: {e}. Proceeding.")
 
-# 3. Dynamic Watchlist Generation
-WATCHLIST = get_dynamic_watchlist(SCREENER_POOL)
+# 4. Market-Wide Dynamic Watchlist Generation
+WATCHLIST = get_market_wide_dynamic_watchlist(EXPANDED_MARKET_UNIVERSE)
 
-# 4. 15m Breakout Scanner + VWAP & ATR
-print("🔍 Scanning dynamic basket for 15m breakout, VWAP & ATR calculation...")
+# 5. 15m Breakout Scanner + VWAP & ATR
+print("🔍 Scanning selected dynamic basket for 15m breakout, VWAP & ATR...")
 try:
     data = yf.download(WATCHLIST, period="5d", interval="5m", progress=False, group_by="ticker")
 except Exception as e:
@@ -284,15 +317,15 @@ symbol = best["symbol"]
 current_price = best["current_price"]
 atr = best["atr"]
 
-# 5. Gemini AI Catalyst Sentiment Check
+# 6. Multi-Source AI Catalyst Sentiment Check
 approved, ai_score, ai_reason = analyze_sentiment_with_ai(symbol)
 if not approved:
-    msg = f"Trade rejected by AI News Gate (Score: {ai_score}/10).\nReason: {ai_reason}"
+    msg = f"Trade rejected by Multi-Source AI Gate (Score: {ai_score}/10).\nReason: {ai_reason}"
     print(f"🛑 {msg}")
     send_alert(f"🛑 AI Suppressed Setup: {symbol}", msg, color=15158332)
     sys.exit(0)
 
-# ATR Dynamic Volatility Sizing
+# 7. ATR Dynamic Volatility Sizing
 candle_risk = round(current_price - best["orb_low"], 2)
 atr_risk = round(1.5 * atr, 2)
 risk_per_share = round(max(candle_risk, atr_risk), 2)
@@ -326,14 +359,14 @@ req = StopLimitOrderRequest(
 )
 
 order = trading_client.submit_order(req)
-print(f"✅ Submitted Native Alpaca ATR-Volatility Bracket for {shares} shares of {symbol}:")
-print(f"   • Entry: ${current_price:.2f} | ATR(14): ${atr:.2f} \vert{} Risk/sh:${risk_per_share:.2f}")
-print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} \vert{} Max Risk: -${total_risk:.2f}")
+print(f"✅ Submitted Native Alpaca Market-Wide ATR Bracket for {shares} shares of {symbol}:")
+print(f"   • Entry: ${current_price:.2f} | ATR(14): ${atr:.2f} | Risk/sh: ${risk_per_share:.2f}")
+print(f"   • Stop Loss: ${stop_price:.2f} | Take Profit: ${target_price:.2f} | Max Risk: -${total_risk:.2f}")
 
 alert_msg = (
     f"**Ticker:** {symbol}\n"
     f"**Shares:** {shares}\n"
-    f"**Order Type:** Stop-Limit Bracket (ATR & Macro Guarded)\n"
+    f"**Order Type:** Stop-Limit Bracket (Market-Wide Screener + ATR)\n"
     f"**Trigger Price:** ${stop_trigger_price:.2f}\n"
     f"**Max Limit Fill:** ${limit_ceiling_price:.2f}\n"
     f"**ATR (14):** ${atr:.2f}\n"
@@ -341,11 +374,11 @@ alert_msg = (
     f"**Stop Loss:** ${stop_price:.2f}\n"
     f"**Take Profit:** ${target_price:.2f}\n"
     f"**Max Risk:** -${total_risk:.2f} USD\n\n"
-    f"🧠 **AI Catalyst Analysis ({ai_score}/10):**\n*{ai_reason}*"
+    f"🧠 **Multi-Source AI Catalyst Analysis ({ai_score}/10):**\n*{ai_reason}*"
 )
-send_alert(f"🚀 Cloud US ATR Bracket Placed: {symbol}", alert_msg, color=3066993)
+send_alert(f"🚀 Cloud US Precision Bracket Placed: {symbol}", alert_msg, color=3066993)
 
-# Trailing Stop to Breakeven (+1R)
+# 8. Trailing Stop to Breakeven (+1R)
 print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
@@ -360,7 +393,7 @@ for _ in range(30):
             if sl_order:
                 trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=current_price))
                 print(f"🔒 Breakeven Triggered: Stop moved to ${current_price:.2f}.")
-                send_alert(f"🛡️ {symbol} Breakeven Activated", f"Price hit ${quote:.2f} (+1R).\nStop Loss raised to${current_price:.2f}.", color=15844367)
+                send_alert(f"🛡️ {symbol} Breakeven Activated", f"Price hit ${quote:.2f} (+1R).\nStop Loss raised to ${current_price:.2f}.", color=15844367)
                 be_set = True
                 break
     except Exception:
