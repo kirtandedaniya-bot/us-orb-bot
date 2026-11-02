@@ -305,6 +305,7 @@ for symbol in WATCHLIST:
 
 if not candidates:
     print("⚠️ No valid breakouts meeting 15m + VWAP criteria. Skipping execution.")
+    send_alert("US ORB Scan Finished", "Scan complete across 24 tickers. No clean breakouts above 15m high & VWAP tonight.", color=8421504)
     sys.exit(0)
 
 candidates.sort(key=lambda x: x["score"], reverse=True)
