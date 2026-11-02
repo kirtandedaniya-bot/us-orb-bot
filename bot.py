@@ -380,8 +380,9 @@ print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
 
-for _ in range(30):
-    time.sleep(15)
+# Trailing sleep loop disabled for ~30s fire-and-forget cloud execution
+# for _ in range(30):
+#     time.sleep(15)
     try:
         quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
         if quote >= be_target and not be_set:
