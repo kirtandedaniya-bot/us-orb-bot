@@ -24,13 +24,11 @@ MAX_RISK_USD = 50.0
 MAX_DAILY_LOSS_USD = -100.0
 TARGET_MULT = 1.5
 
-# Institutional high-momentum universe dynamically scanned each morning
+# Institutional high-momentum universe dynamically scanned each session
 EXPANDED_MARKET_UNIVERSE = [
     "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR",
-    "COIN", "SMCI", "GOOGL", "NFLX", "ARM", "AVGO", "INTC", "MU",
-    "MARA", "RIOT", "HOOD", "AFRM", "SOFI", "DKNG", "UBER", "MSTR",
-    "RIVN", "LCID", "BABA", "BIDU", "PDD", "NIO", "XPEV", "LI",
-    "CRWD", "PANW", "NET", "SNOW", "DDOG", "ZS", "MDB", "PATH"
+    "COIN", "SMCI", "GOOGL", "NFLX", "AVGO", "ARM", "MSTR", "MARA",
+    "SOFI", "UBER", "QCOM", "INTC", "HOOD", "DKNG", "RIVN", "SNOW"
 ]
 
 MACRO_BLACKOUT_DATES = {
@@ -191,7 +189,6 @@ def get_market_wide_dynamic_watchlist(pool):
     active_candidates = []
     
     try:
-        # Fast bulk download of daily data to measure gaps
         daily_df = yf.download(pool, period="5d", interval="1d", progress=False)
         closes = daily_df["Close"]
         
@@ -204,7 +201,6 @@ def get_market_wide_dynamic_watchlist(pool):
                 last_price = float(sym_closes.iloc[-1])
                 gap_pct = ((last_price - prev_close) / prev_close) * 100
                 
-                # Check price range ($15 - $500) and gap range (+1.5% to +8.0%)
                 if 15.0 <= last_price <= 500.0 and 1.5 <= gap_pct <= 8.0:
                     active_candidates.append((sym, gap_pct))
             except Exception:
@@ -389,7 +385,8 @@ for _ in range(30):
         quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
         if quote >= be_target and not be_set:
             orders = trading_client.get_orders()
-            sl_order = next((o for o in orders if o.symbol == symbol and o.side.name == "SELL" and o.order_type.name == "STOP"), None)
+            # Clean string-based match for modern Alpaca SDK
+            sl_order = next((o for o in orders if o.symbol == symbol and str(o.side).lower().endswith("sell") and str(o.order_type).lower().endswith("stop")), None)
             if sl_order:
                 trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=current_price))
                 print(f"🔒 Breakeven Triggered: Stop moved to ${current_price:.2f}.")
