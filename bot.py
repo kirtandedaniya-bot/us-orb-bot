@@ -380,22 +380,4 @@ print("🛡️ Tracking for Breakeven Adjustment (+1R)...")
 be_target = round(current_price + risk_per_share, 2)
 be_set = False
 
-# Trailing sleep loop disabled for ~30s fire-and-forget cloud execution
-# for _ in range(30):
-#     time.sleep(15)
-    try:
-        quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
-        if quote >= be_target and not be_set:
-            orders = trading_client.get_orders()
-            # Clean string-based match for modern Alpaca SDK
-            sl_order = next((o for o in orders if o.symbol == symbol and str(o.side).lower().endswith("sell") and str(o.order_type).lower().endswith("stop")), None)
-            if sl_order:
-                trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=current_price))
-                print(f"🔒 Breakeven Triggered: Stop moved to ${current_price:.2f}.")
-                send_alert(f"🛡️ {symbol} Breakeven Activated", f"Price hit ${quote:.2f} (+1R).\nStop Loss raised to ${current_price:.2f}.", color=15844367)
-                be_set = True
-                break
-    except Exception:
-        pass
-
-print("🏁 Session complete.")
+# Trailing sleep loop disabled for instant ~25s execution
