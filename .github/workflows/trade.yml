@@ -17,23 +17,35 @@ on:
           - trade
           - recap
 
+concurrency:
+  group: us-orb-session-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
-          pip install alpaca-py yfinance openpyxl pytz numpy
+          python -m pip install --upgrade pip
+          pip install alpaca-py yfinance openpyxl pytz numpy requests
+
       - name: Execute Script
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
