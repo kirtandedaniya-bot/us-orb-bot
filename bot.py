@@ -22,7 +22,7 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 MAX_RISK_USD = 50.0
 MAX_DAILY_LOSS_USD = -100.0
-TARGET_MULT = 1.5
+TARGET_MULT = 2.0
 
 # Institutional high-momentum universe dynamically scanned each session
 EXPANDED_MARKET_UNIVERSE = [
@@ -201,7 +201,7 @@ def get_market_wide_dynamic_watchlist(pool):
                 last_price = float(sym_closes.iloc[-1])
                 gap_pct = ((last_price - prev_close) / prev_close) * 100
                 
-                if 15.0 <= last_price <= 500.0 and 1.5 <= gap_pct <= 8.0:
+                if 15.0 <= last_price <= 500.0 and (1.5 <= abs(gap_pct) <= 8.0):
                     active_candidates.append((sym, gap_pct))
             except Exception:
                 continue
@@ -339,20 +339,32 @@ if shares < 1:
 target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
 total_risk = round(shares * risk_per_share, 2)
 
-# Stop-Limit Bracket with Slippage Guard
-stop_trigger_price = round(best["orb_high"] + 0.01, 2)
-limit_ceiling_price = round(stop_trigger_price + max(0.05, risk_per_share * 0.10), 2)
+# Bi-Directional Bracket Order Construction
+side = best.get("side", "BUY")
+
+if side == "BUY":
+    stop_trigger_price = round(best["orb_high"] + 0.01, 2)
+    limit_ceiling_price = round(stop_trigger_price + max(0.05, risk_per_share * 0.10), 2)
+    stop_loss_price = round(current_price - risk_per_share, 2)
+    take_profit_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
+    order_side = OrderSide.BUY
+else:
+    stop_trigger_price = round(best["orb_low"] - 0.01, 2)
+    limit_ceiling_price = round(stop_trigger_price - max(0.05, risk_per_share * 0.10), 2)
+    stop_loss_price = round(current_price + risk_per_share, 2)
+    take_profit_price = round(current_price - (risk_per_share * TARGET_MULT), 2)
+    order_side = OrderSide.SELL
 
 req = StopLimitOrderRequest(
     symbol=symbol,
     qty=shares,
-    side=OrderSide.BUY,
+    side=order_side,
     time_in_force=TimeInForce.GTC,
     order_class=OrderClass.BRACKET,
     stop_price=stop_trigger_price,
     limit_price=limit_ceiling_price,
-    take_profit=TakeProfitRequest(limit_price=target_price),
-    stop_loss=StopLossRequest(stop_price=stop_price)
+    take_profit=TakeProfitRequest(limit_price=take_profit_price),
+    stop_loss=StopLossRequest(stop_price=stop_loss_price)
 )
 
 order = trading_client.submit_order(req)
