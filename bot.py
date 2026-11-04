@@ -159,7 +159,7 @@ Rules:
 - Respond ONLY with valid, raw JSON in this format:
 {{"score": 8, "reason": "Strong earnings follow-through and analyst upgrades supporting upside momentum."}}"""
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent?key={GEMINI_API_KEY}"
         req_body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"response_mime_type": "application/json"}
