@@ -9,7 +9,7 @@ import pytz
 import numpy as np
 import yfinance as yf
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import StopLimitOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 warnings.filterwarnings("ignore")
