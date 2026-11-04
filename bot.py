@@ -360,7 +360,7 @@ req = StopLimitOrderRequest(
     qty=shares,
     side=order_side,
     time_in_force=TimeInForce.GTC,
-    order_class=OrderClass.BRACKET,
+    order_class=None,
     stop_price=stop_trigger_price,
     limit_price=limit_ceiling_price,
     take_profit=TakeProfitRequest(limit_price=take_profit_price),
