@@ -1,0 +1,9 @@
+alpaca-py
+finnhub-python
+yfinance
+openpyxl
+pytz
+numpy
+requests
+google-genai
+anthropic
