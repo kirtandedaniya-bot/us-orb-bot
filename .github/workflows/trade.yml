@@ -2,8 +2,8 @@ name: US Automated ORB Session
 
 on:
   schedule:
-    # 14:45 UTC = 10:45 PM AWST (Standard Time - 15m after 9:30 AM EST Open)
-    - cron: '45 14 * * 1-5'
+    # 15:15 UTC = 11:15 PM AWST (Standard Time - 45m after 9:30 AM EST Open)
+    - cron: '15 15 * * 1-5'
     # 21:05 UTC = 05:05 AM AWST (Market Close Recap)
     - cron: '5 21 * * 1-5'
   workflow_dispatch:
