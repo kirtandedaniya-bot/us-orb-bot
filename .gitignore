@@ -1,0 +1,6 @@
+.env
+trader-broker/.env
+*.env
+__pycache__/
+*.pyc
+*.log
