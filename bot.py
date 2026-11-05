@@ -17,7 +17,7 @@ DISCORD_WEBHOOK_URL = "REDACTED"
 MAX_RISK_USD = 50.0
 TARGET_MULT = 1.5
 EXCEL_PATH = os.path.expanduser("~/Desktop/Trading Journal.xlsx")
-WATCHLIST = ["NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "PLTR", "COIN", "SMCI"]
+WATCHLIST = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AMD", "QQQ", "UBER"]
 
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL or "YOUR_DISCORD" in DISCORD_WEBHOOK_URL:
