@@ -82,6 +82,22 @@ except Exception as e:
     print(f"⚠️ Index check warning: {e}. Proceeding.")
 
 # --- 3. CANDLE BREAKOUT & RVOL SCANNER ---
+# --- 2.5 DAILY CIRCUIT BREAKER ---
+print("
+🛡️ Checking Daily Circuit Breaker...")
+try:
+    today_est = datetime.now(pytz.timezone('US/Eastern')).date()
+    closed_orders = trading_client.get_orders(status='closed', limit=50)
+    today_stops = [o for o in closed_orders if o.filled_at and o.filled_at.date() == today_est and o.order_type.name in ('STOP', 'TRAILING_STOP')]
+    if len(today_stops) >= 2:
+        msg = "2 stop-outs hit today. Market is choppy. Halting to protect capital."
+        print(f"🛑 CIRCUIT BREAKER: {msg}")
+        send_alert("🛑 Circuit Breaker Tripped", msg, color=15158332)
+        sys.exit(0)
+    print("   • Circuit Breaker: Clear ✅")
+except Exception as e:
+    print(f"⚠️ Circuit breaker check warning: {e}")
+
 print("🔍 Scanning liquid tech watchlist for opening range breakout...")
 try:
     # Fetch Watchlist plus SPY benchmark for Relative Strength scoring
@@ -102,7 +118,20 @@ for symbol in WATCHLIST:
         current_price = float(df["Close"].iloc[-1])
         vol_opening = float(df["Volume"].iloc[:3].sum())
 
-        if current_price > orb_high:
+        # --- ATR EXHAUSTION & DEAD RANGE FILTER ---
+        orb_range = orb_high - orb_low
+        try:
+            daily_df = yf.Ticker(symbol).history(period="20d", interval="1d")
+            if len(daily_df) >= 14:
+                daily_atr = (daily_df["High"] - daily_df["Low"]).tail(14).mean()
+                if not (0.25 * daily_atr <= orb_range <= 0.60 * daily_atr):
+                    continue  # Range is too dead (<25%) or exhausted (>60%)
+        except Exception:
+            pass
+
+        # --- CONFIRMED CANDLE CLOSE FILTER ---
+        completed_candle_close = float(df["Close"].iloc[-2])
+        if completed_candle_close > orb_high:
                 # --- RELATIVE STRENGTH ENGINE (vs SPY) ---
             spy_pct = 0.0
             try:
