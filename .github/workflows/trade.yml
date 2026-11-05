@@ -50,6 +50,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
           if [ "${{ github.event.inputs.action }}" = "recap" ] || [ "$(date -u +%H)" = "21" ]; then
+            python eod_flatten.py || true
             python eod_recap.py
           else
             python bot.py
