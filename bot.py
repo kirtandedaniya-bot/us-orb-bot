@@ -24,7 +24,7 @@ API_KEY = os.getenv("ALPACA_API_KEY", "")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1566306841485377536/1ICmUjCfb8J2kGSobqtPacClaDe-k_PpCEHT5HYo-BaxohN-3ZtKkQ6g_CrEoTHvqb_q"
 TARGET_MULT = 1.0
-EXCEL_PATH = os.path.expanduser("~/Desktop/Trading Journal.xlsx")
+EXCEL_PATH = "Trading Journal.xlsx"
 WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
 
 def send_alert(title, message, color=3066993):
