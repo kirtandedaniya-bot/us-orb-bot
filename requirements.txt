@@ -1,9 +1,6 @@
 alpaca-py
-finnhub-python
+pandas
 yfinance
 openpyxl
 pytz
-numpy
 requests
-google-genai
-anthropic
