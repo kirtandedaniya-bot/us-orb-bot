@@ -7,17 +7,25 @@ import warnings
 from datetime import datetime
 import pytz
 import openpyxl
+import pandas as pd
+import yfinance as yf
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 warnings.filterwarnings("ignore")
 
 # --- USER CONFIGURATION ---
-API_KEY = os.getenv("ALPACA_API_KEY", "REDACTED")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "REDACTED")
+API_KEY = os.getenv("ALPACA_API_KEY", "")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 DISCORD_WEBHOOK_URL = "REDACTED"
-MAX_RISK_USD = 50.0
-TARGET_MULT = 1.5
+TARGET_MULT = 1.0
 EXCEL_PATH = os.path.expanduser("~/Desktop/Trading Journal.xlsx")
-WATCHLIST = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AMD", "QQQ", "UBER"]
+WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
 
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL or "YOUR_DISCORD" in DISCORD_WEBHOOK_URL:
@@ -54,15 +62,10 @@ window_end = end_hour * 60 + end_min
 if not (window_start <= current_minutes <= window_end):
     print("\n🛑 TIME GATE HALT: US Market Window is CLOSED.")
     print(f"   • Current AWST Time : {now_awst.strftime('%I:%M:%S %p AWST')}")
-    print(f"   • Allowed US Window : {start_hour:02d}:{start_min:02d} - {end_hour%24:02d}:{end_min:02d} AWST")
     sys.exit(0)
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest, TrailingStopOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-import yfinance as yf
-
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 # --- 2. MARKET BREADTH FILTER (QQQ) ---
 print("\n🔍 Checking US Broad Market Sentiment (QQQ)...")
@@ -81,10 +84,8 @@ try:
 except Exception as e:
     print(f"⚠️ Index check warning: {e}. Proceeding.")
 
-# --- 3. CANDLE BREAKOUT & RVOL SCANNER ---
 # --- 2.5 DAILY CIRCUIT BREAKER ---
-print("
-🛡️ Checking Daily Circuit Breaker...")
+print("\n🛡️ Checking Daily Circuit Breaker...")
 try:
     today_est = datetime.now(pytz.timezone('US/Eastern')).date()
     closed_orders = trading_client.get_orders(status='closed', limit=50)
@@ -98,163 +99,140 @@ try:
 except Exception as e:
     print(f"⚠️ Circuit breaker check warning: {e}")
 
-print("🔍 Scanning liquid tech watchlist for opening range breakout...")
-try:
-    # Fetch Watchlist plus SPY benchmark for Relative Strength scoring
-    dl_tickers = list(set(WATCHLIST + ["SPY"]))
-    data = yf.download(dl_tickers, period="2d", interval="5m", progress=False, group_by="ticker")
-except Exception as e:
-    print(f"❌ Failed to download scanner data: {e}")
-    sys.exit(1)
-
+# --- 3. QUANTITATIVE ORB SCANNER (VWAP, SMA, ATR CLAMP) ---
+print("\n🔍 Scanning mega-cap universe for quantitative ORB setups...")
+NY_TZ = pytz.timezone('America/New_York')
 candidates = []
+
 for symbol in WATCHLIST:
     try:
-        df = data[symbol].dropna()
-        if len(df) < 4:
+        # Macro Trend (20 SMA)
+        end_date = datetime.now(NY_TZ) - pd.Timedelta(days=1)
+        start_date = end_date - pd.Timedelta(days=40)
+        req_daily = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start_date, end=end_date, feed=DataFeed.IEX)
+        daily_bars = data_client.get_stock_bars(req_daily).df
+        if daily_bars.empty: continue
+        daily_bars['sma_20'] = daily_bars['close'].rolling(20).mean()
+        daily_data = daily_bars.iloc[-1]
+        
+        if daily_data['close'] <= daily_data['sma_20']:
             continue
-        orb_high = float(df["High"].iloc[:3].max())
-        orb_low = float(df["Low"].iloc[:3].min())
-        current_price = float(df["Close"].iloc[-1])
-        vol_opening = float(df["Volume"].iloc[:3].sum())
-
-        # --- ATR EXHAUSTION & DEAD RANGE FILTER ---
+            
+        # Intraday ORB Data
+        today = datetime.now(NY_TZ).date()
+        start_time = datetime.combine(today, datetime.min.time()).replace(hour=9, minute=30, tzinfo=NY_TZ)
+        end_time = datetime.combine(today, datetime.min.time()).replace(hour=10, minute=15, tzinfo=NY_TZ)
+        req_intra = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start_time, end=end_time, feed=DataFeed.IEX)
+        intraday_bars = data_client.get_stock_bars(req_intra).df
+        if intraday_bars.empty: continue
+            
+        intraday_bars['typical_price'] = (intraday_bars['high'] + intraday_bars['low'] + intraday_bars['close']) / 3
+        intraday_bars['vp'] = intraday_bars['typical_price'] * intraday_bars['volume']
+        
+        vwap_1015 = intraday_bars['vp'].sum() / intraday_bars['volume'].sum()
+        orb_high = intraday_bars['high'].max()
+        orb_low = intraday_bars['low'].min()
         orb_range = orb_high - orb_low
-        try:
-            daily_df = yf.Ticker(symbol).history(period="20d", interval="1d")
-            if len(daily_df) >= 14:
-                daily_atr = (daily_df["High"] - daily_df["Low"]).tail(14).mean()
-                if not (0.25 * daily_atr <= orb_range <= 0.60 * daily_atr):
-                    continue  # Range is too dead (<25%) or exhausted (>60%)
-        except Exception:
-            pass
-
-        # --- CONFIRMED CANDLE CLOSE FILTER ---
-        completed_candle_close = float(df["Close"].iloc[-2])
-        if completed_candle_close > orb_high:
-                # --- RELATIVE STRENGTH ENGINE (vs SPY) ---
-            spy_pct = 0.0
-            try:
-                spy_df = data["SPY"].dropna() if "SPY" in data else None
-                if spy_df is not None and len(spy_df) >= 3:
-                    spy_open = float(spy_df["Open"].iloc[0])  # Day open
-                    spy_curr = float(spy_df["Close"].iloc[-1])
-                    spy_pct = ((spy_curr - spy_open) / spy_open) * 100
-            except Exception:
-                spy_pct = 0.0
-
-            stock_pct = ((current_price - orb_low) / orb_low) * 100
-            rs_score = stock_pct - spy_pct
-
-            # Only select leaders displaying true Relative Strength over SPY
-            if rs_score <= 0:
-                continue
-
-            score = rs_score * (vol_opening / 100000.0)
-            candidates.append({
-                "symbol": symbol,
-                "current_price": round(current_price, 2),
-                "orb_high": round(orb_high, 2),
-                "orb_low": round(orb_low, 2),
-                "pct": stock_pct,
-            "rs_score": round(rs_score, 2),
-                "score": score
-            })
-    except Exception:
-        continue
+        orb_close = intraday_bars['close'].iloc[-1]
+        
+        atr_14 = daily_data['close'] * 0.02 
+        atr_pct = (orb_range / atr_14) * 100
+        
+        if not (25 <= atr_pct <= 60) or orb_close <= vwap_1015:
+            continue
+            
+        # Dynamic Risk Sizing
+        capital_at_risk = 150 if 30 <= atr_pct <= 45 else 50
+        risk_per_share = orb_high - vwap_1015
+        if risk_per_share <= 0: continue
+        
+        qty = max(1, int(capital_at_risk / risk_per_share))
+        target_price = orb_high + (risk_per_share * TARGET_MULT)
+        
+        candidates.append({
+            "symbol": symbol,
+            "current_price": orb_high,
+            "stop_price": vwap_1015,
+            "target_price": target_price,
+            "shares": qty,
+            "risk_per_share": risk_per_share,
+            "total_risk": capital_at_risk,
+            "atr_pct": atr_pct
+        })
+    except Exception as e:
+        pass
 
 if not candidates:
-    print("⚠️ No valid candle breakouts confirmed above 15m high right now.")
+    print("⚠️ No valid setups passed the ORB filters right now.")
     sys.exit(0)
 
-candidates.sort(key=lambda x: x["score"], reverse=True)
-best = candidates[0]
-symbol = best["symbol"]
-current_price = best["current_price"]
-stop_price = round(best["orb_low"], 2)
-
-risk_per_share = round(current_price - stop_price, 2)
-if risk_per_share <= 0.20 or risk_per_share > (current_price * 0.04):
-    risk_per_share = round(current_price * 0.02, 2)
-    stop_price = round(current_price - risk_per_share, 2)
-
-shares = int(MAX_RISK_USD // risk_per_share)
-if shares < 1:
-    shares = 1
-
-target_price = round(current_price + (risk_per_share * TARGET_MULT), 2)
-total_risk = round(shares * risk_per_share, 2)
-
-# --- 4. SUBMIT TWO-TRANCHE SPLIT BRACKET (Target 1 + Trailing Runner) ---
-q2 = max(1, shares // 2)
-q1 = max(1, shares - q2)
-trail_dollar_dist = round(abs(current_price - stop_price) * 2, 2)
-
-# Tranche 1: Hard 1.0R Target Bracket
-req_t1 = MarketOrderRequest(
-    symbol=symbol,
-    qty=q1,
-    side=OrderSide.BUY,
-    time_in_force=TimeInForce.GTC,
-    order_class=OrderClass.BRACKET,
-    take_profit=TakeProfitRequest(limit_price=target_price),
-    stop_loss=StopLossRequest(stop_price=stop_price)
-)
-order1 = trading_client.submit_order(req_t1)
-
-# Tranche 2: Uncapped Runner with Native 2x ATR Trailing Stop
-req_t2 = TrailingStopOrderRequest(
-    symbol=symbol,
-    qty=q2,
-    side=OrderSide.BUY,
-    time_in_force=TimeInForce.GTC,
-    trail_price=trail_dollar_dist
-)
-order2 = trading_client.submit_order(req_t2)
-
-print(f"[92m✔ Submitted 2-Tranche Order for {symbol}:[0m")
-print(f"   • Leg 1 ({q1} shs): Target ${target_price:.2f} | SL: ${stop_price:.2f}")
-print(f"   • Leg 2 ({q2} shs): Native Trailing Runner (Trail Dist: ${trail_dollar_dist:.2f})")
-
-alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price}\n**Stop Loss:** ${stop_price}\n**Take Profit:** ${target_price}\n**Max Risk:** -${total_risk} USD"
-send_alert(f"🚀 US Trade Executed: {symbol}", alert_msg, color=3066993)
-
+# --- 4. EXECUTION & EXCEL LOGGING ---
 wb = openpyxl.load_workbook(EXCEL_PATH)
 ws = wb.active
-target_row = next((r for r in range(2, 200) if not ws.cell(row=r, column=2).value), ws.max_row + 1)
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-ws.cell(row=target_row, column=2, value=now_str)
-ws.cell(row=target_row, column=3, value=symbol)
-ws.cell(row=target_row, column=4, value="BUY")
-ws.cell(row=target_row, column=5, value=shares)
-ws.cell(row=target_row, column=6, value=float(current_price))
-ws.cell(row=target_row, column=7, value=float(stop_price))
-ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, (H{target_row}-F{target_row})*E{target_row})')
-ws.cell(row=target_row, column=10, value=f'=IF(H{target_row}="", "OPEN", IF(I{target_row}>0, "WIN", IF(I{target_row}<0, "LOSS", "BE")))')
-ws.cell(row=target_row, column=12, value=f"ORB 15m Breakout | +{best['pct']:.1f}%")
-ws.cell(row=target_row, column=13, value=f"TP: ${target_price} | SL: ${stop_price} | Risk: -${total_risk} USD")
+for best in candidates:
+    symbol = best["symbol"]
+    current_price = round(best["current_price"], 2)
+    stop_price = round(best["stop_price"], 2)
+    target_price = round(best["target_price"], 2)
+    shares = best["shares"]
+    total_risk = round(best["total_risk"], 2)
+
+    req = MarketOrderRequest(
+        symbol=symbol,
+        qty=shares,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=target_price),
+        stop_loss=StopLossRequest(stop_price=stop_price)
+    )
+    trading_client.submit_order(req)
+
+    print(f"\n[92m✔ Submitted 1.0R Bracket Order for {symbol}:[0m")
+    print(f"   • Entry: ${current_price:.2f} | TP: ${target_price:.2f} | SL: ${stop_price:.2f}")
+
+    alert_msg = f"**Ticker:** {symbol}\n**Shares:** {shares}\n**Fill:** ${current_price}\n**Stop Loss:** ${stop_price}\n**Take Profit:** ${target_price}\n**Max Risk:** -${total_risk} USD"
+    send_alert(f"🚀 US Trade Executed: {symbol}", alert_msg, color=3066993)
+
+    target_row = next((r for r in range(2, 200) if not ws.cell(row=r, column=2).value), ws.max_row + 1)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ws.cell(row=target_row, column=2, value=now_str)
+    ws.cell(row=target_row, column=3, value=symbol)
+    ws.cell(row=target_row, column=4, value="BUY")
+    ws.cell(row=target_row, column=5, value=shares)
+    ws.cell(row=target_row, column=6, value=float(current_price))
+    ws.cell(row=target_row, column=7, value=float(stop_price))
+    ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, (H{target_row}-F{target_row})*E{target_row})')
+    ws.cell(row=target_row, column=10, value=f'=IF(H{target_row}="", "OPEN", IF(I{target_row}>0, "WIN", IF(I{target_row}<0, "LOSS", "BE")))')
+    ws.cell(row=target_row, column=12, value=f"ORB 10:15 Breakout | ATR: {best['atr_pct']:.1f}%")
+    ws.cell(row=target_row, column=13, value=f"TP: ${target_price} | SL: ${stop_price} | Risk: -${total_risk} USD")
+
 wb.save(EXCEL_PATH)
 
 # --- 5. AUTOMATIC BREAKEVEN MONITOR ---
-print("\n🛡️ Monitoring for Breakeven Adjustment (+1R)...")
-breakeven_threshold = round(current_price + risk_per_share, 2)
-be_set = False
+print("\n🛡️ Monitoring active executions for Breakeven Adjustment (+1R)...")
+be_status = {c['symbol']: False for c in candidates}
 
 for _ in range(30):
     time.sleep(15)
-    try:
-        last_quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
-        if last_quote >= breakeven_threshold and not be_set:
-            orders = trading_client.get_orders()
-            sl_order = next((o for o in orders if o.symbol == symbol and o.side.name == "SELL" and o.order_type.name == "STOP"), None)
-            if sl_order:
-                trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=current_price))
-                print(f"🔒 Breakeven Triggered: Stop Loss updated to Entry (${current_price}). Position is risk-free!")
-                send_alert(f"🛡️ {symbol} Moved to Breakeven", f"Price hit ${last_quote:.2f} (+1R). Stop Loss raised to ${current_price:.2f}.", color=15844367)
-                be_set = True
-                break
-    except Exception:
-        pass
+    for best in candidates:
+        symbol = best["symbol"]
+        if be_status[symbol]: continue
+        
+        breakeven_threshold = round(best["current_price"] + best["risk_per_share"], 2)
+        try:
+            last_quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
+            if last_quote >= breakeven_threshold:
+                orders = trading_client.get_orders()
+                sl_order = next((o for o in orders if o.symbol == symbol and o.side.name == "SELL" and o.order_type.name == "STOP"), None)
+                if sl_order:
+                    trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=best["current_price"]))
+                    print(f"🔒 Breakeven Triggered: {symbol} Stop Loss updated to Entry (${best['current_price']}).")
+                    send_alert(f"🛡️ {symbol} Moved to Breakeven", f"Price hit ${last_quote:.2f} (+1R). Stop Loss raised to ${best['current_price']:.2f}.", color=15844367)
+                    be_status[symbol] = True
+        except Exception:
+            pass
 
 print("🏁 Session complete.")
