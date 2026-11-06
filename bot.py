@@ -24,7 +24,7 @@ API_KEY = os.getenv("ALPACA_API_KEY", "")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 DISCORD_WEBHOOK_URL = "REDACTED"
 TARGET_MULT = 1.0
-EXCEL_PATH = os.path.expanduser("~/Desktop/Trading Journal.xlsx")
+EXCEL_PATH = "Trading Journal.xlsx"
 WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
 
 def send_alert(title, message, color=3066993):
