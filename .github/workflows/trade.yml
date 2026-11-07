@@ -51,6 +51,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ "${{ github.event.inputs.action }}" = "recap" ] || [ "$(date -u +%H)" = "21" ]; then
             python eod_flatten.py || true
