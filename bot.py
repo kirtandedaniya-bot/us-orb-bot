@@ -28,6 +28,20 @@ EXCEL_PATH = "Trading Journal.xlsx"
 WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
 NY_TZ = pytz.timezone('America/New_York')
 
+# INSTITUTIONAL METRICS: Estimated Friction (Slippage + Commissions)
+FRICTION_PER_SHARE = 0.015
+
+# TIER-1 MACRO EVENT CALENDAR (Blocks trading to prevent slippage sweeps)
+US_MACRO_BLACKOUT_DATES = {
+    "2026-11-13": "US Core CPI Release",
+    "2026-12-04": "US Non-Farm Payrolls (NFP)",
+    "2026-12-10": "US Core CPI Release",
+    "2026-12-16": "FOMC Rate Decision",
+    "2027-01-08": "US Non-Farm Payrolls (NFP)",
+    "2027-01-14": "US Core CPI Release",
+    "2027-01-27": "FOMC Rate Decision"
+}
+
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL or "YOUR_DISCORD" in DISCORD_WEBHOOK_URL: return
     payload = {"embeds": [{"title": title, "description": message, "color": color, "footer": {"text": "Bi-Directional US Quant Engine"}}]}
@@ -42,7 +56,20 @@ if not PAPER_API_KEY or not PAPER_SECRET_KEY:
 trading_client = TradingClient(PAPER_API_KEY, PAPER_SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(PAPER_API_KEY, PAPER_SECRET_KEY)
 
-# 2. DAILY CIRCUIT BREAKER
+def check_macro_blackout():
+    today_ny = datetime.now(NY_TZ).strftime("%Y-%m-%d")
+    if today_ny in US_MACRO_BLACKOUT_DATES:
+        event = US_MACRO_BLACKOUT_DATES[today_ny]
+        msg = f"Trading suppressed: Today is a tier-1 macroeconomic event ({event}). Capital preserved."
+        print(f"US MACRO BLACKOUT: {msg}")
+        send_alert("US Macro Event Blackout Activated", msg, color=15844367)
+        return True
+    return False
+
+# 2. EVENT GATES & CIRCUIT BREAKER
+if check_macro_blackout():
+    sys.exit(0)
+
 print("\nChecking Daily Circuit Breaker...")
 try:
     today_est = datetime.now(NY_TZ).date()
@@ -151,10 +178,9 @@ if not candidates:
     send_alert("NO SETUPS", "All US symbols blocked by trend, ATR, or VWAP filters.", color=15548997)
     sys.exit(0)
 
-# Sort by tightest ATR profile
 candidates.sort(key=lambda x: abs(x["atr_pct"] - 37.5))
 
-# 4. EXECUTION & EXCEL LOGGING
+# 4. EXECUTION & NET P&L EXCEL LOGGING
 try:
     wb = openpyxl.load_workbook(EXCEL_PATH)
     ws = wb.active
@@ -198,11 +224,11 @@ for best in candidates:
             ws.cell(row=target_row, column=6, value=float(entry_price))
             ws.cell(row=target_row, column=7, value=float(stop_price))
             
-            # P&L tracking (inverted for short-selling)
+            # Net P&L tracking: (Gross P&L) - (Shares * Friction)
             if signal == OrderSide.BUY:
-                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, (H{target_row}-F{target_row})*E{target_row})')
+                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((H{target_row}-F{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
             else:
-                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, (F{target_row}-H{target_row})*E{target_row})')
+                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((F{target_row}-H{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
                 
             ws.cell(row=target_row, column=10, value=f'=IF(H{target_row}="", "OPEN", IF(I{target_row}>0, "WIN", IF(I{target_row}<0, "LOSS", "BE")))')
             ws.cell(row=target_row, column=12, value=f"ORB 10:15 Breakout | ATR: {best['atr_pct']:.1f}%")
@@ -225,13 +251,9 @@ for _ in range(30):
         risk_per_share = best["risk_per_share"]
         entry_price = best["entry_price"]
         
-        if signal == OrderSide.BUY:
-            breakeven_threshold = round(entry_price + risk_per_share, 2)
-        else:
-            breakeven_threshold = round(entry_price - risk_per_share, 2)
+        breakeven_threshold = round(entry_price + risk_per_share, 2) if signal == OrderSide.BUY else round(entry_price - risk_per_share, 2)
             
         try:
-            # Using yfinance for real-time unthrottled quotes in paper trading
             last_quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
             
             trigger_be = False
@@ -252,4 +274,4 @@ for _ in range(30):
         except Exception:
             pass
 
-print("Session complete.")
+print("US Session complete.")
