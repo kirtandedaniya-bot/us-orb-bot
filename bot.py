@@ -17,6 +17,9 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+import db_manager
+import event_manager
+
 warnings.filterwarnings("ignore")
 
 # 1. SECURE CONFIGURATION
@@ -27,20 +30,7 @@ TARGET_MULT = 1.0
 EXCEL_PATH = "Trading Journal.xlsx"
 WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
 NY_TZ = pytz.timezone('America/New_York')
-
-# INSTITUTIONAL METRICS: Estimated Friction (Slippage + Commissions)
 FRICTION_PER_SHARE = 0.015
-
-# TIER-1 MACRO EVENT CALENDAR (Blocks trading to prevent slippage sweeps)
-US_MACRO_BLACKOUT_DATES = {
-    "2026-11-13": "US Core CPI Release",
-    "2026-12-04": "US Non-Farm Payrolls (NFP)",
-    "2026-12-10": "US Core CPI Release",
-    "2026-12-16": "FOMC Rate Decision",
-    "2027-01-08": "US Non-Farm Payrolls (NFP)",
-    "2027-01-14": "US Core CPI Release",
-    "2027-01-27": "FOMC Rate Decision"
-}
 
 def send_alert(title, message, color=3066993):
     if not DISCORD_WEBHOOK_URL or "YOUR_DISCORD" in DISCORD_WEBHOOK_URL: return
@@ -56,18 +46,13 @@ if not PAPER_API_KEY or not PAPER_SECRET_KEY:
 trading_client = TradingClient(PAPER_API_KEY, PAPER_SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(PAPER_API_KEY, PAPER_SECRET_KEY)
 
-def check_macro_blackout():
-    today_ny = datetime.now(NY_TZ).strftime("%Y-%m-%d")
-    if today_ny in US_MACRO_BLACKOUT_DATES:
-        event = US_MACRO_BLACKOUT_DATES[today_ny]
-        msg = f"Trading suppressed: Today is a tier-1 macroeconomic event ({event}). Capital preserved."
-        print(f"US MACRO BLACKOUT: {msg}")
-        send_alert("US Macro Event Blackout Activated", msg, color=15844367)
-        return True
-    return False
-
 # 2. EVENT GATES & CIRCUIT BREAKER
-if check_macro_blackout():
+blackout_event = event_manager.is_macro_blackout_active("US")
+if blackout_event:
+    msg = f"Trading suppressed: Today is a tier-1 macroeconomic event ({blackout_event}). Capital preserved."
+    print(f"US MACRO BLACKOUT: {msg}")
+    send_alert("US Macro Event Blackout Activated", msg, color=15844367)
+    db_manager.log_system_event("US_ALPACA", "BLACKOUT", msg)
     sys.exit(0)
 
 print("\nChecking Daily Circuit Breaker...")
@@ -79,6 +64,7 @@ try:
         msg = "2 stop-outs hit today. Market is choppy. Halting to protect capital."
         print(f"CIRCUIT BREAKER: {msg}")
         send_alert("Circuit Breaker Tripped", msg, color=15158332)
+        db_manager.log_system_event("US_ALPACA", "CIRCUIT_BREAKER", msg)
         sys.exit(0)
     print("Circuit Breaker: Clear")
 except Exception as e:
@@ -90,7 +76,6 @@ candidates = []
 
 for symbol in WATCHLIST:
     try:
-        # Macro Trend (20 SMA)
         end_date = datetime.now(NY_TZ) - pd.Timedelta(days=1)
         start_date = end_date - pd.Timedelta(days=40)
         req_daily = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start_date, end=end_date, feed=DataFeed.IEX)
@@ -104,7 +89,6 @@ for symbol in WATCHLIST:
         sma_20 = daily_data['sma_20']
         market_trend = 1 if daily_close > sma_20 else -1
         
-        # Intraday ORB Data
         today = datetime.now(NY_TZ).date()
         start_time = datetime.combine(today, datetime.min.time()).replace(hour=9, minute=30, tzinfo=NY_TZ)
         end_time = datetime.combine(today, datetime.min.time()).replace(hour=10, minute=15, tzinfo=NY_TZ)
@@ -134,7 +118,6 @@ for symbol in WATCHLIST:
         stop_price = 0.0
         target_price = 0.0
         
-        # LONG LOGIC: Bull Market, Price > VWAP, Breaks ORB High
         if market_trend == 1 and orb_close > vwap_1015 and orb_close >= orb_high:
             signal = OrderSide.BUY
             risk_per_share = orb_high - vwap_1015
@@ -143,7 +126,6 @@ for symbol in WATCHLIST:
             stop_price = vwap_1015
             target_price = entry_price + (risk_per_share * TARGET_MULT)
             
-        # SHORT LOGIC: Bear Market, Price < VWAP, Breaks ORB Low
         elif market_trend == -1 and orb_close < vwap_1015 and orb_close <= orb_low:
             signal = OrderSide.SELL
             risk_per_share = vwap_1015 - orb_low
@@ -154,7 +136,6 @@ for symbol in WATCHLIST:
             
         if not signal: continue
         
-        # Dynamic Kelly Risk Sizing
         capital_at_risk = 150.0 if 30 <= atr_pct <= 45 else 50.0
         qty = max(1, int(capital_at_risk / risk_per_share))
         
@@ -167,20 +148,21 @@ for symbol in WATCHLIST:
             "shares": qty,
             "risk_per_share": risk_per_share,
             "total_risk": capital_at_risk,
-            "atr_pct": atr_pct
+            "atr_pct": atr_pct,
+            "market_regime": market_trend
         })
     except Exception as e:
         print(f"Error processing {symbol}: {e}")
-        pass
 
 if not candidates:
     print("No valid setups passed the ORB filters right now.")
     send_alert("NO SETUPS", "All US symbols blocked by trend, ATR, or VWAP filters.", color=15548997)
+    db_manager.log_system_event("US_ALPACA", "NO_SETUPS", "No candidates passed quantitative screening.")
     sys.exit(0)
 
 candidates.sort(key=lambda x: abs(x["atr_pct"] - 37.5))
 
-# 4. EXECUTION & NET P&L EXCEL LOGGING
+# 4. EXECUTION & LOGGING
 try:
     wb = openpyxl.load_workbook(EXCEL_PATH)
     ws = wb.active
@@ -210,7 +192,23 @@ for best in candidates:
         trading_client.submit_order(req)
         action_str = "LONG" if signal == OrderSide.BUY else "SHORT"
         print(f"\nSubmitted 1.0R {action_str} Bracket Order for {symbol}")
-        print(f"Entry: ${entry_price:.2f} | TP: ${target_price:.2f} | SL: ${stop_price:.2f}")
+        
+        # INSTITUTIONAL SUPABASE LOGGING
+        db_manager.log_trade(
+            engine="US_ALPACA",
+            symbol=symbol,
+            direction=action_str,
+            regime=best["market_regime"],
+            atr=round(best["atr_pct"], 2),
+            vwap=stop_price, 
+            entry=entry_price,
+            stop=stop_price,
+            target=target_price,
+            shares=shares,
+            risk=round(best["risk_per_share"], 2),
+            total_risk=total_risk,
+            status="OPEN"
+        )
         
         alert_msg = f"**Ticker:** {symbol}\n**Action:** {action_str} (Bi-Directional Active)\n**Shares:** {shares}\n**Fill:** ${entry_price:.2f}\n**Stop Loss (VWAP):** ${stop_price:.2f}\n**Take Profit (+1.0R):** ${target_price:.2f}\n**Max Risk:** ${total_risk} USD"
         send_alert(f"US Trade Executed: {symbol}", alert_msg, color=16711680 if signal == OrderSide.SELL else 3066993)
@@ -223,13 +221,10 @@ for best in candidates:
             ws.cell(row=target_row, column=5, value=shares)
             ws.cell(row=target_row, column=6, value=float(entry_price))
             ws.cell(row=target_row, column=7, value=float(stop_price))
-            
-            # Net P&L tracking: (Gross P&L) - (Shares * Friction)
             if signal == OrderSide.BUY:
                 ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((H{target_row}-F{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
             else:
                 ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((F{target_row}-H{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
-                
             ws.cell(row=target_row, column=10, value=f'=IF(H{target_row}="", "OPEN", IF(I{target_row}>0, "WIN", IF(I{target_row}<0, "LOSS", "BE")))')
             ws.cell(row=target_row, column=12, value=f"ORB 10:15 Breakout | ATR: {best['atr_pct']:.1f}%")
             ws.cell(row=target_row, column=13, value=f"TP: ${target_price} | SL: ${stop_price} | Risk: ${total_risk}")
@@ -237,6 +232,7 @@ for best in candidates:
             
     except Exception as e:
         print(f"Order Failed for {symbol}: {e}")
+        db_manager.log_system_event("US_ALPACA", "ORDER_ERROR", f"Order Failed for {symbol}: {e}")
 
 # 5. AUTOMATIC BREAKEVEN MONITOR
 print("\nMonitoring active executions for Breakeven Adjustment (+1R)...")
@@ -270,6 +266,7 @@ for _ in range(30):
                     trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=entry_price))
                     print(f"Breakeven Triggered: {symbol} Stop Loss updated to Entry (${entry_price}). Position is risk-free!")
                     send_alert(f"{symbol} Moved to Breakeven", f"Price hit target threshold. Stop Loss secured at ${entry_price:.2f}.", color=15844367)
+                    db_manager.log_system_event("US_ALPACA", "BREAKEVEN_ADJUST", f"{symbol} stop moved to breakeven at {entry_price}")
                     be_status[symbol] = True
         except Exception:
             pass
