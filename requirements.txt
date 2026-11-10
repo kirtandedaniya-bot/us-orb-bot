@@ -1,8 +1,6 @@
-alpaca-py
-pandas
-yfinance
-openpyxl
-pytz
+alpaca-py>=0.30
+pandas>=2.0
+numpy
 requests
 psycopg2-binary
 python-dotenv
