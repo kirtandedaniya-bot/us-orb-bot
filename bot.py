@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from orb import notify  # noqa: E402
+from orb import ai_analyst, notify  # noqa: E402
 from orb.broker import Broker, retry  # noqa: E402
 from orb.strategy import Params, Setup, build_setup  # noqa: E402
 
@@ -91,7 +91,7 @@ def gates(b: Broker, now: datetime) -> bool:
     return True
 
 
-def scan(b: Broker, today: date, symbols: list[str]) -> list[Setup]:
+def scan(b: Broker, today: date, symbols: list[str]) -> list[tuple[Setup, float]]:
     daily = b.daily_bars(symbols, today)
     start, end = datetime.combine(today, P.orb_start, NY), datetime.combine(today, P.orb_end, NY)
     orb = b.orb_bars(symbols, start, end)
@@ -105,7 +105,7 @@ def scan(b: Broker, today: date, symbols: list[str]) -> list[Setup]:
         s = build_setup(sym, o, d, P)
         log.info("%s -> %s", sym, fmt(s) if s else "no setup")
         if s:
-            out.append(s)
+            out.append((s, float(d["close"].iloc[-1])))
     return out
 
 
@@ -157,6 +157,24 @@ def watch_and_fire(b: Broker, pending: list[Setup], today: date) -> None:
         notify.event("NO_TRIGGER", f"Not triggered by deadline: {[s.symbol for s in pending]}")
 
 
+def ai_gate_blocks(s: Setup, today: date, prev_close: float | None) -> bool:
+    """Ask Claude; log verdict. Only blocks when AI_MODE=gate. Failures never block."""
+    if not ai_analyst.enabled():
+        return False
+    v = ai_analyst.analyse(s, today, prev_close)
+    mode = ai_analyst.AI_MODE
+    if v is None:
+        notify.event("AI_VERDICT", f"{s.symbol}: no verdict (API/news failure) — proceeding")
+        return False
+    would_block = v.blocks
+    notify.event("AI_VERDICT", f"{s.symbol} [{mode}] {ai_analyst.to_json(v)}")
+    notify.discord(f"Claude: {s.symbol} {v.decision.upper()} ({v.conviction})",
+                   f"{v.reason}\nFlags: {', '.join(v.risk_flags) or 'none'}\n"
+                   f"Mode: {mode}{' — WOULD SKIP (not enforced)' if would_block and mode == 'shadow' else ''}",
+                   notify.AMBER if would_block else notify.GREY)
+    return mode == "gate" and would_block
+
+
 def mode_trade(b: Broker) -> int:
     now = now_ny()
     if not gates(b, now):
@@ -170,7 +188,8 @@ def mode_trade(b: Broker) -> int:
     symbols = [s for s in UNIVERSE if s not in held]
 
     sleep_until(datetime.combine(today, time(10, 15, 5), NY))
-    setups = scan(b, today, symbols)
+    scanned = scan(b, today, symbols)
+    setups = [s for s, _ in scanned]
     if not setups:
         notify.event("NO_SETUPS", "No symbols passed V1 filters", alert=True, color=notify.GREY)
         return 0
@@ -183,6 +202,8 @@ def mode_trade(b: Broker) -> int:
             notify.event("SKIP_CHASE", f"{s.symbol} already {p} vs trigger {s.level}"); continue
         if s.side == -1 and not shortable(b, s.symbol):
             notify.event("NOT_SHORTABLE", s.symbol); continue
+        if ai_gate_blocks(s, today, dict((x.symbol, pc) for x, pc in scanned).get(s.symbol)):
+            continue
         r = submit(b, s, cid(today, s.symbol), market=False)
         if r == "ok":
             placed.append(s)
