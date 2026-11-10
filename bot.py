@@ -1,274 +1,297 @@
+"""US ORB v2 — live engine. Rules come from orb/strategy.py (same code the backtest runs).
+
+Modes (each is idempotent and checks its own time window, so double cron runs are harmless):
+  python bot.py trade    ~09:45 ET  wait to 10:15, place stop-entry brackets
+  python bot.py cancel   ~11:31 ET  cancel unfilled entries
+  python bot.py eod      ~15:35 ET  flatten everything, verify, recap
+"""
+import logging
 import os
 import sys
-import time
-import json
-import urllib.request
-import warnings
-import pandas as pd
-from datetime import datetime
-import pytz
-import openpyxl
-import yfinance as yf
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
+import time as _time
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
-import db_manager
-import event_manager
+from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (GetOrdersRequest, MarketOrderRequest, StopLossRequest,
+                                     StopOrderRequest, TakeProfitRequest)
+from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore")
+load_dotenv()
 
-# 1. SECURE CONFIGURATION
-PAPER_API_KEY = os.getenv("ALPACA_API_KEY", "")
-PAPER_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-TARGET_MULT = 1.0
-EXCEL_PATH = "Trading Journal.xlsx"
-WATCHLIST = ["AAPL", "MSFT", "NVDA", "QQQ"]
-NY_TZ = pytz.timezone('America/New_York')
-FRICTION_PER_SHARE = 0.015
+from orb import notify  # noqa: E402
+from orb.broker import Broker, retry  # noqa: E402
+from orb.strategy import Params, Setup, build_setup  # noqa: E402
 
-def send_alert(title, message, color=3066993):
-    if not DISCORD_WEBHOOK_URL or "YOUR_DISCORD" in DISCORD_WEBHOOK_URL: return
-    payload = {"embeds": [{"title": title, "description": message, "color": color, "footer": {"text": "Bi-Directional US Quant Engine"}}]}
-    req = urllib.request.Request(DISCORD_WEBHOOK_URL, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-    try: urllib.request.urlopen(req)
-    except Exception: pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("orb")
 
-if not PAPER_API_KEY or not PAPER_SECRET_KEY:
-    print("API Keys missing! Halting execution.")
-    sys.exit(1)
+NY = ZoneInfo("America/New_York")
+UNIVERSE = os.getenv("UNIVERSE", "AAPL,MSFT,NVDA,QQQ").split(",")
+P = Params()
+CID = "orb"                       # client_order_id prefix: orb-YYYYMMDD-SYM
+TRADE_WINDOW = (time(9, 35), time(10, 40))
+CANCEL_WINDOW = (time(11, 30), time(12, 29))
+MAX_CHASE_R = 0.5                 # skip if price already > 0.5R past the trigger
+OPEN_STATES = {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW, OrderStatus.HELD}
 
-trading_client = TradingClient(PAPER_API_KEY, PAPER_SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(PAPER_API_KEY, PAPER_SECRET_KEY)
 
-# 2. EVENT GATES & CIRCUIT BREAKER
-blackout_event = event_manager.is_macro_blackout_active("US")
-if blackout_event:
-    msg = f"Trading suppressed: Today is a tier-1 macroeconomic event ({blackout_event}). Capital preserved."
-    print(f"US MACRO BLACKOUT: {msg}")
-    send_alert("US Macro Event Blackout Activated", msg, color=15844367)
-    db_manager.log_system_event("US_ALPACA", "BLACKOUT", msg)
-    sys.exit(0)
+def now_ny() -> datetime:
+    return datetime.now(NY)
 
-print("\nChecking Daily Circuit Breaker...")
-try:
-    today_est = datetime.now(NY_TZ).date()
-    closed_orders = trading_client.get_orders(status='closed', limit=50)
-    today_stops = [o for o in closed_orders if o.filled_at and o.filled_at.date() == today_est and o.order_type.name in ('STOP', 'TRAILING_STOP')]
-    if len(today_stops) >= 2:
-        msg = "2 stop-outs hit today. Market is choppy. Halting to protect capital."
-        print(f"CIRCUIT BREAKER: {msg}")
-        send_alert("Circuit Breaker Tripped", msg, color=15158332)
-        db_manager.log_system_event("US_ALPACA", "CIRCUIT_BREAKER", msg)
-        sys.exit(0)
-    print("Circuit Breaker: Clear")
-except Exception as e:
-    print(f"Circuit breaker check warning: {e}")
 
-# 3. BI-DIRECTIONAL QUANTITATIVE ORB SCANNER
-print(f"\nScanning mega-cap universe for bi-directional ORB setups...")
-candidates = []
+def cid(d: date, sym: str) -> str:
+    return f"{CID}-{d:%Y%m%d}-{sym}"
 
-for symbol in WATCHLIST:
+
+def in_window(t: time, w: tuple[time, time]) -> bool:
+    return w[0] <= t <= w[1]
+
+
+def sleep_until(target: datetime) -> None:
+    while (left := (target - now_ny()).total_seconds()) > 0:
+        _time.sleep(min(left, 30))
+
+
+def bracket(s: Setup, cid_: str, market: bool) -> MarketOrderRequest | StopOrderRequest:
+    kw = dict(symbol=s.symbol, qty=s.shares, side=OrderSide.BUY if s.side == 1 else OrderSide.SELL,
+              time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET, client_order_id=cid_,
+              take_profit=TakeProfitRequest(limit_price=s.target), stop_loss=StopLossRequest(stop_price=s.stop))
+    return MarketOrderRequest(**kw) if market else StopOrderRequest(stop_price=s.level, **kw)
+
+
+def fmt(s: Setup) -> str:
+    return (f"**{s.symbol}** {'LONG' if s.side == 1 else 'SHORT'} x{s.shares} | trigger ${s.level:.2f} | "
+            f"stop ${s.stop:.2f} | target ${s.target:.2f} | risk ${s.risk_ps * s.shares:.0f} | ATR% {s.atr_pct:.0f}")
+
+
+# ======================= TRADE =======================
+def gates(b: Broker, now: datetime) -> bool:
+    if os.getenv("TRADING_ENABLED", "true").lower() == "false":
+        notify.event("KILL_SWITCH", "TRADING_ENABLED=false — no trades today", alert=True, color=notify.AMBER)
+        return False
+    sess = b.session(now.date())
+    if sess is None:
+        log.info("Market closed today"); return False
+    if sess[1].time() != time(16, 0):
+        notify.event("EARLY_CLOSE", f"Half day (close {sess[1]:%H:%M}) — skipping", alert=True, color=notify.AMBER)
+        return False
+    if not in_window(now.time(), TRADE_WINDOW):
+        log.info("Outside trade window %s (now %s ET) — exit", TRADE_WINDOW, now.strftime("%H:%M")); return False
     try:
-        end_date = datetime.now(NY_TZ) - pd.Timedelta(days=1)
-        start_date = end_date - pd.Timedelta(days=40)
-        req_daily = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start_date, end=end_date, feed=DataFeed.IEX)
-        daily_bars = data_client.get_stock_bars(req_daily).df
-        if daily_bars.empty: continue
-        
-        daily_bars['sma_20'] = daily_bars['close'].rolling(20).mean()
-        daily_data = daily_bars.iloc[-1]
-        
-        daily_close = daily_data['close']
-        sma_20 = daily_data['sma_20']
-        market_trend = 1 if daily_close > sma_20 else -1
-        
-        today = datetime.now(NY_TZ).date()
-        start_time = datetime.combine(today, datetime.min.time()).replace(hour=9, minute=30, tzinfo=NY_TZ)
-        end_time = datetime.combine(today, datetime.min.time()).replace(hour=10, minute=15, tzinfo=NY_TZ)
-        
-        req_intra = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start_time, end=end_time, feed=DataFeed.IEX)
-        intraday_bars = data_client.get_stock_bars(req_intra).df
-        if intraday_bars.empty: continue
-        
-        intraday_bars['typical_price'] = (intraday_bars['high'] + intraday_bars['low'] + intraday_bars['close']) / 3.0
-        intraday_bars['vp'] = intraday_bars['typical_price'] * intraday_bars['volume']
-        vwap_1015 = intraday_bars['vp'].sum() / intraday_bars['volume'].sum()
-        
-        orb_high = intraday_bars['high'].max()
-        orb_low = intraday_bars['low'].min()
-        orb_range = orb_high - orb_low
-        orb_close = intraday_bars['close'].iloc[-1]
-        
-        atr_14 = daily_close * 0.02
-        atr_pct = (orb_range / atr_14) * 100
-        
-        if not (25 <= atr_pct <= 60):
-            continue
-            
-        signal = None
-        risk_per_share = 0.0
-        entry_price = 0.0
-        stop_price = 0.0
-        target_price = 0.0
-        
-        if market_trend == 1 and orb_close > vwap_1015 and orb_close >= orb_high:
-            signal = OrderSide.BUY
-            risk_per_share = orb_high - vwap_1015
-            if risk_per_share <= 0.02: continue
-            entry_price = orb_high
-            stop_price = vwap_1015
-            target_price = entry_price + (risk_per_share * TARGET_MULT)
-            
-        elif market_trend == -1 and orb_close < vwap_1015 and orb_close <= orb_low:
-            signal = OrderSide.SELL
-            risk_per_share = vwap_1015 - orb_low
-            if risk_per_share <= 0.02: continue
-            entry_price = orb_low
-            stop_price = vwap_1015
-            target_price = entry_price - (risk_per_share * TARGET_MULT)
-            
-        if not signal: continue
-        
-        capital_at_risk = 150.0 if 30 <= atr_pct <= 45 else 50.0
-        qty = max(1, int(capital_at_risk / risk_per_share))
-        
-        candidates.append({
-            "symbol": symbol,
-            "signal": signal,
-            "entry_price": round(entry_price, 2),
-            "stop_price": round(stop_price, 2),
-            "target_price": round(target_price, 2),
-            "shares": qty,
-            "risk_per_share": risk_per_share,
-            "total_risk": capital_at_risk,
-            "atr_pct": atr_pct,
-            "market_regime": market_trend
-        })
+        import event_manager
+        ev = event_manager.is_macro_blackout_active("US")
     except Exception as e:
-        print(f"Error processing {symbol}: {e}")
+        ev = None
+        notify.event("CALENDAR_ERROR", f"{e} — not blocking", alert=True, color=notify.AMBER)
+    if ev:
+        notify.event("BLACKOUT", f"Tier-1 macro event: {ev}", alert=True, color=notify.AMBER)
+        return False
+    return True
 
-if not candidates:
-    print("No valid setups passed the ORB filters right now.")
-    send_alert("NO SETUPS", "All US symbols blocked by trend, ATR, or VWAP filters.", color=15548997)
-    db_manager.log_system_event("US_ALPACA", "NO_SETUPS", "No candidates passed quantitative screening.")
-    sys.exit(0)
 
-candidates.sort(key=lambda x: abs(x["atr_pct"] - 37.5))
+def scan(b: Broker, today: date, symbols: list[str]) -> list[Setup]:
+    daily = b.daily_bars(symbols, today)
+    start, end = datetime.combine(today, P.orb_start, NY), datetime.combine(today, P.orb_end, NY)
+    orb = b.orb_bars(symbols, start, end)
+    out = []
+    for sym in symbols:
+        o, d = orb.get(sym), daily.get(sym)
+        if o is None or d is None or o.empty:
+            notify.event("DATA_MISSING", f"{sym}: no bars"); continue
+        if o.index[-1] < end - timedelta(minutes=5):
+            notify.event("DATA_STALE", f"{sym}: last ORB bar {o.index[-1]:%H:%M}"); continue
+        s = build_setup(sym, o, d, P)
+        log.info("%s -> %s", sym, fmt(s) if s else "no setup")
+        if s:
+            out.append(s)
+    return out
 
-# 4. EXECUTION & LOGGING
-try:
-    wb = openpyxl.load_workbook(EXCEL_PATH)
-    ws = wb.active
-except Exception:
-    wb = None
 
-for best in candidates:
-    symbol = best["symbol"]
-    signal = best["signal"]
-    entry_price = best["entry_price"]
-    stop_price = best["stop_price"]
-    target_price = best["target_price"]
-    shares = best["shares"]
-    total_risk = round(best["total_risk"], 2)
-    
-    req = MarketOrderRequest(
-        symbol=symbol,
-        qty=shares,
-        side=signal,
-        time_in_force=TimeInForce.DAY,
-        order_class=OrderClass.BRACKET,
-        take_profit=TakeProfitRequest(limit_price=target_price),
-        stop_loss=StopLossRequest(stop_price=stop_price)
-    )
-    
+def shortable(b: Broker, sym: str) -> bool:
+    a = retry(lambda: b.trading.get_asset(sym), f"asset {sym}")
+    return bool(a.shortable and a.easy_to_borrow)
+
+
+def submit(b: Broker, s: Setup, cid_: str, market: bool) -> str:
+    """Returns 'ok' | 'dup' | 'unsupported' | 'error'."""
     try:
-        trading_client.submit_order(req)
-        action_str = "LONG" if signal == OrderSide.BUY else "SHORT"
-        print(f"\nSubmitted 1.0R {action_str} Bracket Order for {symbol}")
-        
-        # INSTITUTIONAL SUPABASE LOGGING
-        db_manager.log_trade(
-            engine="US_ALPACA",
-            symbol=symbol,
-            direction=action_str,
-            regime=best["market_regime"],
-            atr=round(best["atr_pct"], 2),
-            vwap=stop_price, 
-            entry=entry_price,
-            stop=stop_price,
-            target=target_price,
-            shares=shares,
-            risk=round(best["risk_per_share"], 2),
-            total_risk=total_risk,
-            status="OPEN"
-        )
-        
-        alert_msg = f"**Ticker:** {symbol}\n**Action:** {action_str} (Bi-Directional Active)\n**Shares:** {shares}\n**Fill:** ${entry_price:.2f}\n**Stop Loss (VWAP):** ${stop_price:.2f}\n**Take Profit (+1.0R):** ${target_price:.2f}\n**Max Risk:** ${total_risk} USD"
-        send_alert(f"US Trade Executed: {symbol}", alert_msg, color=16711680 if signal == OrderSide.SELL else 3066993)
-        
-        if wb:
-            target_row = next((r for r in range(2, 200) if not ws.cell(row=r, column=2).value), ws.max_row + 1)
-            ws.cell(row=target_row, column=2, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            ws.cell(row=target_row, column=3, value=symbol)
-            ws.cell(row=target_row, column=4, value="BUY" if signal == OrderSide.BUY else "SELL")
-            ws.cell(row=target_row, column=5, value=shares)
-            ws.cell(row=target_row, column=6, value=float(entry_price))
-            ws.cell(row=target_row, column=7, value=float(stop_price))
-            if signal == OrderSide.BUY:
-                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((H{target_row}-F{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
-            else:
-                ws.cell(row=target_row, column=9, value=f'=IF(H{target_row}="", 0, ((F{target_row}-H{target_row})*E{target_row}) - (E{target_row}*{FRICTION_PER_SHARE}))')
-            ws.cell(row=target_row, column=10, value=f'=IF(H{target_row}="", "OPEN", IF(I{target_row}>0, "WIN", IF(I{target_row}<0, "LOSS", "BE")))')
-            ws.cell(row=target_row, column=12, value=f"ORB 10:15 Breakout | ATR: {best['atr_pct']:.1f}%")
-            ws.cell(row=target_row, column=13, value=f"TP: ${target_price} | SL: ${stop_price} | Risk: ${total_risk}")
-            wb.save(EXCEL_PATH)
-            
+        retry(lambda: b.trading.submit_order(bracket(s, cid_, market)), f"submit {s.symbol}")
+        return "ok"
+    except APIError as e:
+        m = str(e).lower()
+        if "client_order_id" in m and "unique" in m:
+            return "dup"
+        if not market and ("bracket" in m or "order type" in m or "not supported" in m):
+            return "unsupported"
+        notify.event("ORDER_REJECTED", f"{s.symbol}: {e}", alert=True, color=notify.RED)
+        return "error"
     except Exception as e:
-        print(f"Order Failed for {symbol}: {e}")
-        db_manager.log_system_event("US_ALPACA", "ORDER_ERROR", f"Order Failed for {symbol}: {e}")
+        notify.event("ORDER_ERROR", f"{s.symbol}: {e}", alert=True, color=notify.RED)
+        return "error"
 
-# 5. AUTOMATIC BREAKEVEN MONITOR
-print("\nMonitoring active executions for Breakeven Adjustment (+1R)...")
-be_status = {c['symbol']: False for c in candidates}
-for _ in range(30):
-    time.sleep(15)
-    for best in candidates:
-        symbol = best["symbol"]
-        if be_status[symbol]: continue
-        
-        signal = best["signal"]
-        risk_per_share = best["risk_per_share"]
-        entry_price = best["entry_price"]
-        
-        breakeven_threshold = round(entry_price + risk_per_share, 2) if signal == OrderSide.BUY else round(entry_price - risk_per_share, 2)
-            
+
+def watch_and_fire(b: Broker, pending: list[Setup], today: date) -> None:
+    """Fallback if Alpaca rejects stop-entry brackets: poll and fire market brackets on the cross."""
+    deadline = datetime.combine(today, P.entry_deadline, NY)
+    notify.event("WATCH_MODE", f"Watching {[s.symbol for s in pending]} until {deadline:%H:%M} ET")
+    while pending and now_ny() < deadline:
         try:
-            last_quote = yf.Ticker(symbol).history(period="1d", interval="1m")["Close"].iloc[-1]
-            
-            trigger_be = False
-            if signal == OrderSide.BUY and last_quote >= breakeven_threshold:
-                trigger_be = True
-            elif signal == OrderSide.SELL and last_quote <= breakeven_threshold:
-                trigger_be = True
-                
-            if trigger_be:
-                orders = trading_client.get_orders()
-                sl_side = "SELL" if signal == OrderSide.BUY else "BUY"
-                sl_order = next((o for o in orders if o.symbol == symbol and o.side.name == sl_side and o.order_type.name == "STOP"), None)
-                if sl_order:
-                    trading_client.replace_order_by_id(sl_order.id, ReplaceOrderRequest(stop_price=entry_price))
-                    print(f"Breakeven Triggered: {symbol} Stop Loss updated to Entry (${entry_price}). Position is risk-free!")
-                    send_alert(f"{symbol} Moved to Breakeven", f"Price hit target threshold. Stop Loss secured at ${entry_price:.2f}.", color=15844367)
-                    db_manager.log_system_event("US_ALPACA", "BREAKEVEN_ADJUST", f"{symbol} stop moved to breakeven at {entry_price}")
-                    be_status[symbol] = True
-        except Exception:
-            pass
+            px = b.last_price([s.symbol for s in pending])
+        except Exception as e:
+            log.warning("price poll failed: %s", e); _time.sleep(10); continue
+        for s in list(pending):
+            p = px.get(s.symbol)
+            if p is None or not ((s.side == 1 and p >= s.level) or (s.side == -1 and p <= s.level)):
+                continue
+            pending.remove(s)
+            inside = (s.stop < p < s.target) if s.side == 1 else (s.target < p < s.stop)
+            if not inside or s.side * (p - s.level) > MAX_CHASE_R * s.risk_ps:
+                notify.event("SKIP_CHASE", f"{s.symbol} crossed but price {p} too far / outside bracket")
+                continue
+            if submit(b, s, cid(today, s.symbol), market=True) == "ok":
+                notify.event("ENTRY_FIRED", f"{s.symbol} market bracket @~{p}", alert=True)
+        _time.sleep(5)
+    if pending:
+        notify.event("NO_TRIGGER", f"Not triggered by deadline: {[s.symbol for s in pending]}")
 
-print("US Session complete.")
+
+def mode_trade(b: Broker) -> int:
+    now = now_ny()
+    if not gates(b, now):
+        return 0
+    today = now.date()
+
+    held = {p.symbol for p in retry(b.trading.get_all_positions, "positions")}
+    if held:
+        notify.event("LEFTOVER_POSITIONS", f"Open before entry: {held} — excluded. Check EOD job!",
+                     alert=True, color=notify.RED)
+    symbols = [s for s in UNIVERSE if s not in held]
+
+    sleep_until(datetime.combine(today, time(10, 15, 5), NY))
+    setups = scan(b, today, symbols)
+    if not setups:
+        notify.event("NO_SETUPS", "No symbols passed V1 filters", alert=True, color=notify.GREY)
+        return 0
+
+    px = b.last_price([s.symbol for s in setups])
+    placed, watch = [], []
+    for s in setups:
+        p = px.get(s.symbol)
+        if p is not None and s.side * (p - s.level) > MAX_CHASE_R * s.risk_ps:
+            notify.event("SKIP_CHASE", f"{s.symbol} already {p} vs trigger {s.level}"); continue
+        if s.side == -1 and not shortable(b, s.symbol):
+            notify.event("NOT_SHORTABLE", s.symbol); continue
+        r = submit(b, s, cid(today, s.symbol), market=False)
+        if r == "ok":
+            placed.append(s)
+            notify.trade(symbol=s.symbol, direction="LONG" if s.side == 1 else "SHORT", regime=s.trend,
+                         atr=round(s.atr_pct, 2), vwap=round(s.vwap, 4), entry=s.level, stop=s.stop,
+                         target=s.target, shares=s.shares, risk=s.risk_ps,
+                         total_risk=round(s.risk_ps * s.shares, 2), status="PENDING_ENTRY")
+        elif r == "dup":
+            log.info("%s already submitted today", s.symbol)
+        elif r == "unsupported":
+            watch.append(s)
+
+    if placed:
+        notify.discord("US ORB: entries armed", "\n".join(fmt(s) for s in placed), notify.GREEN)
+    if watch:
+        watch_and_fire(b, watch, today)
+    return 0
+
+
+# ======================= CANCEL =======================
+def mode_cancel(b: Broker) -> int:
+    now = now_ny()
+    if not in_window(now.time(), CANCEL_WINDOW):
+        log.info("Outside cancel window — exit"); return 0
+    orders = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)),
+                   "open orders")
+    n = 0
+    for o in orders:
+        if (o.client_order_id or "").startswith(f"{CID}-{now:%Y%m%d}") and o.status in OPEN_STATES \
+                and float(o.filled_qty or 0) == 0:
+            retry(lambda: b.trading.cancel_order_by_id(o.id), f"cancel {o.symbol}")
+            n += 1
+    notify.event("ENTRIES_EXPIRED", f"Cancelled {n} untriggered entries", alert=n > 0, color=notify.GREY)
+    return 0
+
+
+# ======================= EOD =======================
+def flatten(b: Broker) -> list:
+    for attempt in range(1, 4):
+        retry(lambda: b.trading.close_all_positions(cancel_orders=True), "close_all")
+        for _ in range(12):
+            _time.sleep(5)
+            left = retry(b.trading.get_all_positions, "positions")
+            if not left:
+                return []
+        log.warning("flatten round %d: %d positions remain", attempt, len(left))
+    return left
+
+
+def recap(b: Broker, today: date) -> None:
+    acct = retry(b.trading.get_account, "account")
+    pnl = float(acct.equity) - float(acct.last_equity)
+    after = datetime.combine(today, time(0, 0), NY)
+    orders = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True,
+                                                                 after=after, limit=200)), "orders")
+    lines = []
+    for o in orders:
+        if not (o.client_order_id or "").startswith(f"{CID}-{today:%Y%m%d}") or float(o.filled_qty or 0) == 0:
+            continue
+        entry, qty = float(o.filled_avg_price), float(o.filled_qty)
+        side = 1 if o.side == OrderSide.BUY else -1
+        leg = next((l for l in (o.legs or []) if float(l.filled_qty or 0) > 0), None)
+        if leg:
+            ex = float(leg.filled_avg_price)
+            reason = "TARGET" if leg.type.value == "limit" else "STOP"
+            tp = side * (ex - entry) * qty
+            lines.append(f"{o.symbol}: {reason} {entry:.2f}->{ex:.2f} = ${tp:+.2f}")
+            notify.trade(symbol=o.symbol, direction="LONG" if side == 1 else "SHORT", regime=0, atr=0, vwap=0,
+                         entry=entry, stop=0, target=0, shares=int(qty), risk=0, total_risk=0,
+                         status="CLOSED", pnl=round(tp, 2), exit_reason=reason)
+        else:
+            lines.append(f"{o.symbol}: filled {entry:.2f}, closed by EOD flatten")
+    body = f"Day P&L: **${pnl:+.2f}** | Equity ${float(acct.equity):,.2f}\n" + ("\n".join(lines) or "No fills")
+    notify.discord(f"US ORB recap {today}", body, notify.GREEN if pnl >= 0 else notify.RED)
+
+
+def mode_eod(b: Broker) -> int:
+    now = now_ny()
+    sess = b.session(now.date())
+    positions = retry(b.trading.get_all_positions, "positions")
+    close = sess[1] if sess else datetime.combine(now.date(), time(16, 0), NY)
+    if now < close - timedelta(minutes=25):
+        log.info("Too early for EOD (close %s) — exit", close.strftime("%H:%M")); return 0
+    late = now > close + timedelta(minutes=20)
+    if late and not positions:
+        log.info("Late duplicate run, nothing open — exit"); return 0
+
+    left = flatten(b) if positions else []
+    if left:
+        notify.event("FLATTEN_FAILED", f"STILL OPEN: {[(p.symbol, p.qty) for p in left]} — CLOSE MANUALLY",
+                     alert=True, color=notify.RED)
+        return 2
+    if positions:
+        notify.event("SYSTEM_FLATTEN", f"Flattened {len(positions)} positions" + (" (AFTER CLOSE)" if late else ""),
+                     alert=True, color=notify.RED if late else notify.ORANGE)
+    if not late and sess:
+        recap(b, now.date())
+    return 0
+
+
+MODES = {"trade": mode_trade, "cancel": mode_cancel, "eod": mode_eod}
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode not in MODES:
+        sys.exit(f"usage: python bot.py [{'|'.join(MODES)}]")
+    try:
+        sys.exit(MODES[mode](Broker()))
+    except Exception as e:
+        log.exception("fatal")
+        notify.event("FATAL", f"{mode}: {e!r}", alert=True, color=notify.RED)
+        sys.exit(1)
