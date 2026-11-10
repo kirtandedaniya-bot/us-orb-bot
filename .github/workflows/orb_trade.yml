@@ -1,0 +1,33 @@
+name: US ORB - entries
+
+on:
+  schedule:
+    # 09:45 ET (both crons cover EDT/EST; bot exits if outside window)
+    - cron: '45 13 * * 1-5'
+    - cron: '45 14 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: orb-trade
+  cancel-in-progress: false
+
+jobs:
+  run:
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
+        run: python bot.py trade

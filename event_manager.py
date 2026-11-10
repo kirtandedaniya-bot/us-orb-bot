@@ -1,40 +1,32 @@
+"""Tier-1 macro blackout check via Finnhub economic calendar."""
 import os
-import requests
 from datetime import datetime
-import pytz
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-TIER_1_KEYWORDS = ["Fed Interest Rate Decision", "Core CPI", "Nonfarm Payrolls", "RBA Interest Rate Decision", "Employment Change"]
+TIER_1_KEYWORDS = ["Fed Interest Rate Decision", "FOMC", "CPI", "Nonfarm Payrolls",
+                   "RBA Interest Rate Decision", "Employment Change"]
 
-def is_macro_blackout_active(market="US"):
+
+def is_macro_blackout_active(market: str = "US") -> Optional[str]:
+    """Returns event name if a high-impact tier-1 event is today, else None. Raises on API failure."""
     if not FINNHUB_API_KEY:
-        print("Finnhub API key missing. Defaulting to NO BLACKOUT.")
-        return False
-        
-    tz = pytz.timezone('America/New_York') if market == "US" else pytz.timezone('Australia/Sydney')
-    today_str = datetime.now(tz).strftime('%Y-%m-%d')
-    
-    url = f"https://finnhub.io/api/v1/calendar/economic?from={today_str}&to={today_str}&token={FINNHUB_API_KEY}"
-    
-    try:
-        response = requests.get(url, timeout=5)
-        events = response.json().get("economicCalendar", [])
-        target_country = "US" if market == "US" else "AU"
-        
-        for event in events:
-            country = event.get("country", "")
-            impact = event.get("impact", "")
-            event_name = event.get("event", "")
-            
-            if country == target_country and impact == "high":
-                for keyword in TIER_1_KEYWORDS:
-                    if keyword.lower() in event_name.lower():
-                        return event_name
-                        
-        return False
-    except Exception as e:
-        print(f"Calendar API Error: {e}")
-        return False
+        return None
+    tz = ZoneInfo("America/New_York" if market == "US" else "Australia/Sydney")
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    r = requests.get("https://finnhub.io/api/v1/calendar/economic",
+                     params={"from": today, "to": today, "token": FINNHUB_API_KEY}, timeout=10)
+    r.raise_for_status()
+    country = "US" if market == "US" else "AU"
+    for ev in r.json().get("economicCalendar", []):
+        name = ev.get("event", "")
+        if ev.get("country") == country and ev.get("impact") == "high" \
+                and any(k.lower() in name.lower() for k in TIER_1_KEYWORDS):
+            return name
+    return None
