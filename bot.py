@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import (GetOrdersRequest, MarketOrderRequest, StopLossRequest,
-                                     StopOrderRequest, TakeProfitRequest)
+from alpaca.trading.requests import (GetOrdersRequest, GetPortfolioHistoryRequest, MarketOrderRequest,
+                                     StopLossRequest, StopOrderRequest, TakeProfitRequest)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,6 +34,9 @@ CID = "orb"                       # client_order_id prefix: orb-YYYYMMDD-SYM
 TRADE_WINDOW = (time(9, 25), time(10, 40))  # cron fires ~09:30 ET; GitHub delays tolerated
 CANCEL_WINDOW = (time(11, 30), time(12, 29))
 MAX_CHASE_R = 0.5                 # skip if price already > 0.5R past the trigger
+# Monte Carlo (research/robustness.py): 99th-pct max drawdown over 2024-26 was ~$3.8k.
+# A deeper drawdown means live results no longer match the backtest -> stop and investigate.
+MAX_DRAWDOWN_USD = float(os.getenv("MAX_DRAWDOWN_USD", "3800"))
 OPEN_STATES = {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW, OrderStatus.HELD}
 
 
@@ -67,6 +70,20 @@ def fmt(s: Setup) -> str:
 
 
 # ======================= TRADE =======================
+def drawdown(b: Broker) -> float | None:
+    """$ drop of account equity from its 1-year peak (None if history unavailable)."""
+    try:
+        h = retry(lambda: b.trading.get_portfolio_history(GetPortfolioHistoryRequest(period="1A", timeframe="1D")),
+                  "portfolio history")
+        eq = [float(e) for e in (h.equity or []) if e is not None and float(e) > 0]
+        acct = retry(b.trading.get_account, "account")
+        eq.append(float(acct.equity))
+        return max(eq) - eq[-1]
+    except Exception as e:
+        log.warning("drawdown check failed: %s", e)
+        return None
+
+
 def gates(b: Broker, now: datetime) -> bool:
     if os.getenv("TRADING_ENABLED", "true").lower() == "false":
         notify.event("KILL_SWITCH", "TRADING_ENABLED=false — no trades today", alert=True, color=notify.AMBER)
@@ -79,6 +96,12 @@ def gates(b: Broker, now: datetime) -> bool:
         return False
     if not in_window(now.time(), TRADE_WINDOW):
         log.info("Outside trade window %s (now %s ET) — exit", TRADE_WINDOW, now.strftime("%H:%M")); return False
+    dd = drawdown(b)
+    if dd is not None and dd >= MAX_DRAWDOWN_USD:
+        notify.event("DRAWDOWN_BREAKER", f"Equity ${dd:,.0f} below 1-year peak (limit ${MAX_DRAWDOWN_USD:,.0f}). "
+                     "Trading paused — strategy is outside its tested range. Set repo variable "
+                     "MAX_DRAWDOWN_USD higher only after review.", alert=True, color=notify.RED)
+        return False
     try:
         import event_manager
         ev = event_manager.is_macro_blackout_active("US")
