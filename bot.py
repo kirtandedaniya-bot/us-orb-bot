@@ -31,7 +31,7 @@ NY = ZoneInfo("America/New_York")
 UNIVERSE = os.getenv("UNIVERSE", "AAPL,MSFT,NVDA,QQQ").split(",")
 P = Params()
 CID = "orb"                       # client_order_id prefix: orb-YYYYMMDD-SYM
-TRADE_WINDOW = (time(9, 35), time(10, 40))
+TRADE_WINDOW = (time(9, 25), time(10, 40))  # cron fires ~09:30 ET; GitHub delays tolerated
 CANCEL_WINDOW = (time(11, 30), time(12, 29))
 MAX_CHASE_R = 0.5                 # skip if price already > 0.5R past the trigger
 OPEN_STATES = {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW, OrderStatus.HELD}
@@ -264,9 +264,16 @@ def mode_eod(b: Broker) -> int:
     sess = b.session(now.date())
     positions = retry(b.trading.get_all_positions, "positions")
     close = sess[1] if sess else datetime.combine(now.date(), time(16, 0), NY)
-    if now < close - timedelta(minutes=25):
+    flat_at = close - timedelta(minutes=10)
+    # GitHub cron can start 40-60 min late, so the job is scheduled ~45 min early and waits here
+    if now < flat_at - timedelta(minutes=75):
         log.info("Too early for EOD (close %s) — exit", close.strftime("%H:%M")); return 0
-    late = now > close + timedelta(minutes=20)
+    if now < flat_at:
+        log.info("Waiting until %s ET to flatten", flat_at.strftime("%H:%M"))
+        sleep_until(flat_at)
+        now = now_ny()
+        positions = retry(b.trading.get_all_positions, "positions")
+    late = now >= close  # after the bell: only act if something is still open (no duplicate recap)
     if late and not positions:
         log.info("Late duplicate run, nothing open — exit"); return 0
 
