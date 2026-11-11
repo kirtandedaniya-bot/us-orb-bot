@@ -58,7 +58,7 @@ if __name__ == "__main__":
     ap.add_argument("cache")
     ap.add_argument("--slip", type=float, default=0.01)
     ap.add_argument("--split", default=None, help="YYYY-MM-DD: report in-sample vs out-of-sample")
-    ap.add_argument("--target-r", type=float, default=1.0)
+    ap.add_argument("--target-r", type=float, default=Params().target_r)
     ap.add_argument("--csv", default="trades.csv")
     a = ap.parse_args()
 
