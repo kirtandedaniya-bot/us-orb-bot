@@ -1,0 +1,41 @@
+name: ETF momentum - monthly rebalance
+
+on:
+  schedule:
+    # ~09:50 ET on days 1-7 (both crons cover EST/EDT; bot acts only on the first trading day, once)
+    - cron: '50 14 1-7 * *'
+    - cron: '50 15 1-7 * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal | force (rebalance now, market open) | dry-run'
+        default: 'dry-run'
+
+concurrency:
+  group: etf-rebalance
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Rebalance
+        env:
+          ETF_ALPACA_API_KEY: ${{ secrets.ETF_ALPACA_API_KEY }}
+          ETF_ALPACA_SECRET_KEY: ${{ secrets.ETF_ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETF_TRADING_ENABLED: ${{ vars.ETF_TRADING_ENABLED || 'true' }}
+        run: |
+          case "${{ github.event.inputs.mode }}" in
+            force)   python etf_bot.py --force ;;
+            dry-run) python etf_bot.py --dry-run ;;
+            *)       python etf_bot.py ;;
+          esac

@@ -186,7 +186,7 @@ def mode_trade(b: Broker) -> int:
         return 0
     today = now.date()
 
-    held = {p.symbol for p in retry(b.trading.get_all_positions, "positions")}
+    held = {p.symbol for p in own_positions(b)}
     if held:
         notify.event("LEFTOVER_POSITIONS", f"Open before entry: {held} — excluded. Check EOD job!",
                      alert=True, color=notify.RED)
@@ -243,12 +243,30 @@ def mode_cancel(b: Broker) -> int:
 
 
 # ======================= EOD =======================
+def own_positions(b: Broker) -> list:
+    """Only this bot's symbols — never touch anything else in the account."""
+    return [p for p in retry(b.trading.get_all_positions, "positions") if p.symbol in UNIVERSE]
+
+
 def flatten(b: Broker) -> list:
     for attempt in range(1, 4):
-        retry(lambda: b.trading.close_all_positions(cancel_orders=True), "close_all")
+        open_ = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)),
+                      "open orders")
+        for o in open_:
+            if (o.client_order_id or "").startswith(f"{CID}-") or o.symbol in UNIVERSE:
+                try:
+                    b.trading.cancel_order_by_id(o.id)
+                except Exception as e:
+                    log.warning("cancel %s: %s", o.symbol, e)
+        _time.sleep(2)
+        for p in own_positions(b):
+            try:
+                b.trading.close_position(p.symbol)
+            except Exception as e:
+                log.warning("close %s: %s", p.symbol, e)
         for _ in range(12):
             _time.sleep(5)
-            left = retry(b.trading.get_all_positions, "positions")
+            left = own_positions(b)
             if not left:
                 return []
         log.warning("flatten round %d: %d positions remain", attempt, len(left))
@@ -293,7 +311,7 @@ def recap(b: Broker, today: date) -> None:
 def mode_eod(b: Broker) -> int:
     now = now_ny()
     sess = b.session(now.date())
-    positions = retry(b.trading.get_all_positions, "positions")
+    positions = own_positions(b)
     close = sess[1] if sess else datetime.combine(now.date(), time(16, 0), NY)
     flat_at = close - timedelta(minutes=10)
     # GitHub cron can start 40-60 min late, so the job is scheduled ~45 min early and waits here
@@ -303,7 +321,7 @@ def mode_eod(b: Broker) -> int:
         log.info("Waiting until %s ET to flatten", flat_at.strftime("%H:%M"))
         sleep_until(flat_at)
         now = now_ny()
-        positions = retry(b.trading.get_all_positions, "positions")
+        positions = own_positions(b)
     late = now >= close  # after the bell: only act if something is still open (no duplicate recap)
     if late and not positions:
         log.info("Late duplicate run, nothing open — exit"); return 0
