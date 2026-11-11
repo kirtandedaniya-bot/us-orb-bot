@@ -62,7 +62,21 @@ def main() -> int:
                   ("NYSE", "NASDAQ", "AMEX", "ARCA", "BATS") and "/" not in a.symbol)
     print("assets", len(syms), flush=True)
 
-    # Stage 2: daily
+    # Stage 2: daily (resumable)
+    if (OUT / "daily.parquet").exists():
+        d = pd.read_parquet(OUT / "daily.parquet"); print("resume daily", flush=True)
+    else:
+        d = None
+    if d is None:
+        d = _daily(syms)
+    cand = d[(d.prev_close > 5) & (d.avgvol14 > 1e6) & (d.atr14 > 0.5)]
+    csyms = sorted(cand.symbol.unique())
+    days = sorted(cand.date.unique())
+    print("daily rows", len(d), "candidate symbols", len(csyms), "days", len(days), flush=True)
+    return _rest(d, csyms, days)
+
+
+def _daily(syms) -> pd.DataFrame:
     parts = [bars(c, TimeFrame.Day, START, END) for c in chunks(syms, 200)]
     d = pd.concat([p for p in parts if not p.empty])
     d["date"] = pd.to_datetime(d["timestamp"]).dt.tz_convert(NY).dt.date
@@ -75,23 +89,34 @@ def main() -> int:
     d["prev_close"] = pc
     d = d[["symbol", "date", "open", "high", "low", "close", "volume", "prev_close", "atr14", "avgvol14"]]
     d.to_parquet(OUT / "daily.parquet", compression="zstd")
-    cand = d[(d.prev_close > 5) & (d.avgvol14 > 1e6) & (d.atr14 > 0.5)]
-    csyms = sorted(cand.symbol.unique())
-    days = sorted(cand.date.unique())
-    print("daily rows", len(d), "candidate symbols", len(csyms), "days", len(days), flush=True)
+    return d
 
-    # Stage 3: first 5-min bar per day for all candidate symbols
-    f5 = []
+
+def _first5(csyms, days) -> pd.DataFrame:
+    """Per-month checkpoints in OUT/f5/ so a timed-out run resumes where it stopped."""
+    ck = OUT / "f5"; ck.mkdir(exist_ok=True)
     tf5 = TimeFrame(5, TimeFrameUnit.Minute)
-    for i, day in enumerate(days):
-        s = datetime.combine(day, time(9, 30), NY)
-        for c in chunks(csyms, 400):
-            b = bars(c, tf5, s, s + timedelta(minutes=4))
-            if not b.empty:
-                f5.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
-        if i % 50 == 0:
-            print("first5 day", i, day, flush=True)
-    f5 = pd.concat(f5)
+    months = sorted({(dy.year, dy.month) for dy in days})
+    for (y, mo) in months:
+        f = ck / f"{y}-{mo:02d}.parquet"
+        if f.exists():
+            continue
+        part = []
+        for day in [dy for dy in days if (dy.year, dy.month) == (y, mo)]:
+            s = datetime.combine(day, time(9, 30), NY)
+            for c in chunks(csyms, 400):
+                b = bars(c, tf5, s, s + timedelta(minutes=4))
+                if not b.empty:
+                    part.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        if part:
+            pd.concat(part).to_parquet(f, compression="zstd")
+        print("first5 month", y, mo, flush=True)
+    return pd.concat(pd.read_parquet(f) for f in sorted(ck.glob("*.parquet")))
+
+
+def _rest(d, csyms, days) -> int:
+    # Stage 3: first 5-min bar per day for all candidate symbols
+    f5 = _first5(csyms, days)
     f5["date"] = pd.to_datetime(f5["timestamp"]).dt.tz_convert(NY).dt.date
     f5 = f5[pd.to_datetime(f5["timestamp"]).dt.tz_convert(NY).dt.time == time(9, 30)]
     f5 = f5.drop(columns="timestamp").sort_values(["symbol", "date"])
@@ -107,23 +132,28 @@ def main() -> int:
     sel.to_csv(OUT / "selected.csv", index=False)
     print("selected symbol-days", len(sel), flush=True)
 
-    # Stage 5: 1-min bars for selected symbol-days
-    out = []
-    for i, (day, grp) in enumerate(sel.groupby("date")):
-        s = datetime.combine(day, time(9, 30), NY)
-        b = bars(list(grp.symbol), TimeFrame.Minute, s, datetime.combine(day, time(15, 59), NY))
-        if not b.empty:
-            out.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
-        if i % 50 == 0:
-            print("intraday day", i, day, flush=True)
-    intr = pd.concat(out)
-    intr["timestamp"] = pd.to_datetime(intr["timestamp"])
-    for c in ("open", "high", "low", "close", "volume"):
-        intr[c] = intr[c].astype("float32")
-    intr["year"] = intr["timestamp"].dt.year
-    for y, part in intr.groupby("year"):
-        part.drop(columns="year").to_parquet(OUT / f"intraday_{y}.parquet", compression="zstd")
-    print("intraday rows", len(intr), flush=True)
+    # Stage 5: 1-min bars for selected symbol-days, one checkpoint file per month
+    sel["date"] = pd.to_datetime(sel["date"]).dt.date
+    sel["ym"] = sel["date"].map(lambda x: f"{x.year}-{x.month:02d}")
+    n = 0
+    for ym, mgrp in sel.groupby("ym"):
+        f = OUT / f"intraday_{ym}.parquet"
+        if f.exists():
+            continue
+        out = []
+        for day, grp in mgrp.groupby("date"):
+            s = datetime.combine(day, time(9, 30), NY)
+            b = bars(list(grp.symbol), TimeFrame.Minute, s, datetime.combine(day, time(15, 59), NY))
+            if not b.empty:
+                out.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        if out:
+            intr = pd.concat(out)
+            intr["timestamp"] = pd.to_datetime(intr["timestamp"])
+            for c in ("open", "high", "low", "close", "volume"):
+                intr[c] = intr[c].astype("float32")
+            intr.to_parquet(f, compression="zstd"); n += len(intr)
+        print("intraday month", ym, flush=True)
+    print("intraday rows (this run)", n, flush=True)
     return 0
 
 

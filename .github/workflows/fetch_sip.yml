@@ -9,22 +9,35 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install alpaca-py pandas pyarrow numpy
+      - name: Restore checkpoints
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/data
+          key: sip-ckpt-${{ github.run_id }}
+          restore-keys: sip-ckpt-
       - name: Download bars
+        timeout-minutes: 320
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python research/fetch_sip.py /tmp/data
+      - name: Save checkpoints (also on timeout)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/data
+          key: sip-ckpt-${{ github.run_id }}
       - name: Publish to orphan branch "data-sip"
         run: |
           cd /tmp/data
-          rm -f daily.parquet first5.parquet   # >100MB; backtest only needs selected.csv + intraday_*
+          rm -rf daily.parquet first5.parquet f5   # >100MB; backtest only needs selected.csv + intraday_*
           ls -la
           git init -q -b data-sip
           git config user.name "github-actions"
