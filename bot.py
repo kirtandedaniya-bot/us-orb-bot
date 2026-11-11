@@ -228,6 +228,10 @@ def mode_trade(b: Broker) -> int:
 # ======================= CANCEL =======================
 def mode_cancel(b: Broker) -> int:
     now = now_ny()
+    start = datetime.combine(now.date(), CANCEL_WINDOW[0], NY)
+    if start - timedelta(minutes=45) <= now < start:   # cron arrived early-ish after GitHub delay: wait
+        log.info("Waiting until %s ET to cancel", CANCEL_WINDOW[0].strftime("%H:%M"))
+        sleep_until(start); now = now_ny()
     if not in_window(now.time(), CANCEL_WINDOW):
         log.info("Outside cancel window — exit"); return 0
     orders = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)),
@@ -297,6 +301,7 @@ def recap(b: Broker, today: date) -> None:
         else:
             lines.append(f"{o.symbol}: filled {entry:.2f}, closed by EOD flatten")
     body = f"Day P&L: **${pnl:+.2f}** | Equity ${float(acct.equity):,.2f}\n" + ("\n".join(lines) or "No fills")
+    log.info("RECAP %s | %s", today, body.replace("\n", " | "))
     try:
         chk = monitor.sprt(monitor.live_r(b.trading))
         body += "\n" + monitor.summary_line(chk)
@@ -339,7 +344,16 @@ def mode_eod(b: Broker) -> int:
     return 0
 
 
-MODES = {"trade": mode_trade, "cancel": mode_cancel, "eod": mode_eod}
+def mode_report(b: Broker) -> int:
+    """On-demand recap of the most recent session (no orders touched)."""
+    d = now_ny().date()
+    if len(sys.argv) > 2:
+        d = date.fromisoformat(sys.argv[2])
+    recap(b, d)
+    return 0
+
+
+MODES = {"trade": mode_trade, "cancel": mode_cancel, "eod": mode_eod, "report": mode_report}
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
