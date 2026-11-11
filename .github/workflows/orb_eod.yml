@@ -27,7 +27,6 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
         run: python bot.py eod
