@@ -24,6 +24,11 @@ class Params:
     min_risk_ps: float = 0.02
     target_r: float = 1.5               # robust 1.25–2.0R plateau; 1.5R chosen (see PR)
     max_notional: float = 50_000.0        # per-position cap ($)
+    # research switches (defaults = live behaviour)
+    trend_len: int = 20                   # SMA length for trend filter (0 = no filter: both sides allowed)
+    stop_mode: str = "vwap"               # "vwap" | "mid" (ORB midpoint)
+    entry_mode: str = "touch"             # "touch" (stop order) | "close" (1-min close beyond level, fill next open)
+    be_at_r: float = 0.0                  # move stop to entry after +be_at_r R (0 = off)
 
 
 @dataclass(frozen=True)
@@ -48,23 +53,26 @@ def r2(x: float) -> float:
     return float(np.round(x + 1e-9, 2))
 
 
-def daily_context(daily: pd.DataFrame) -> tuple[float, int]:
-    """daily: PRIOR sessions only, cols high/low/close, oldest->newest. Returns (ATR14, trend)."""
-    if len(daily) < 21:
+def daily_context(daily: pd.DataFrame, trend_len: int = 20) -> tuple[float, int]:
+    """daily: PRIOR sessions only, cols high/low/close, oldest->newest. Returns (ATR14, trend).
+    trend_len=0 -> trend 2 (= no filter, either side allowed)."""
+    if len(daily) < max(21, trend_len + 1):
         return float("nan"), 0
     pc = daily["close"].shift(1)
     tr = pd.concat([daily["high"] - daily["low"], (daily["high"] - pc).abs(), (daily["low"] - pc).abs()],
                    axis=1).max(axis=1)
     atr = float(tr.iloc[-14:].mean())
-    last, sma20 = float(daily["close"].iloc[-1]), float(daily["close"].iloc[-20:].mean())
-    return atr, (1 if last > sma20 else -1)
+    if trend_len == 0:
+        return atr, 2
+    last, sma = float(daily["close"].iloc[-1]), float(daily["close"].iloc[-trend_len:].mean())
+    return atr, (1 if last > sma else -1)
 
 
 def build_setup(symbol: str, orb: pd.DataFrame, daily: pd.DataFrame, p: Params = Params()) -> Optional[Setup]:
     """orb: 1-min bars in ORB window (cols high/low/close/volume). daily: prior sessions."""
     if len(orb) < p.min_orb_bars or orb["volume"].sum() <= 0:
         return None
-    atr, trend = daily_context(daily)
+    atr, trend = daily_context(daily, p.trend_len)
     if trend == 0 or not np.isfinite(atr) or atr <= 0:
         return None
 
@@ -75,10 +83,11 @@ def build_setup(symbol: str, orb: pd.DataFrame, daily: pd.DataFrame, p: Params =
     if not (p.atr_lo <= atr_pct <= p.atr_hi):
         return None
 
-    if trend == 1 and last > vwap:
-        side, level, stop = 1, r2(hi), r2(vwap)
-    elif trend == -1 and last < vwap:
-        side, level, stop = -1, r2(lo), r2(vwap)
+    anchor = vwap if p.stop_mode == "vwap" else (hi + lo) / 2
+    if trend in (1, 2) and last > vwap:
+        side, level, stop = 1, r2(hi), r2(anchor)
+    elif trend in (-1, 2) and last < vwap:
+        side, level, stop = -1, r2(lo), r2(anchor)
     else:
         return None
 
@@ -97,24 +106,41 @@ def simulate(s: Setup, post: pd.DataFrame, p: Params = Params(), slip: float = 0
     """Bar-by-bar fill sim on 1-min bars from orb_end onward (index = timestamps, col 't' = time).
     Stop checked before target inside a bar (conservative)."""
     window = post[post["t"] < p.entry_deadline]
-    hit = window[window["high"] >= s.level] if s.side == 1 else window[window["low"] <= s.level]
-    if hit.empty:
-        return None
-    eb = hit.iloc[0]
-    fill = (max(eb["open"], s.level) + slip) if s.side == 1 else (min(eb["open"], s.level) - slip)
+    if p.entry_mode == "close":
+        hit = window[window["close"] > s.level] if s.side == 1 else window[window["close"] < s.level]
+        if hit.empty:
+            return None
+        nxt = post.loc[hit.index[0]:].iloc[1:2]
+        if nxt.empty:
+            return None
+        eb = nxt.iloc[0]
+        fill = eb["open"] + s.side * slip
+    else:
+        hit = window[window["high"] >= s.level] if s.side == 1 else window[window["low"] <= s.level]
+        if hit.empty:
+            return None
+        eb = hit.iloc[0]
+        fill = (max(eb["open"], s.level) + slip) if s.side == 1 else (min(eb["open"], s.level) - slip)
 
+    stop, moved = s.stop, False
+    if s.side * (fill - stop) <= 0 or s.side * (s.target - fill) <= 0:   # gapped through stop/target at entry
+        return None
     exit_px, reason = None, None
     for ts, x in post.loc[eb.name:].iterrows():
         if x["t"] >= p.flat_time:
             exit_px, reason = x["open"] - s.side * slip, "EOD"
             break
-        if (s.side == 1 and x["low"] <= s.stop) or (s.side == -1 and x["high"] >= s.stop):
-            px = min(x["open"], s.stop) if s.side == 1 else max(x["open"], s.stop)
-            exit_px, reason = px - s.side * slip, "STOP"
+        if (s.side == 1 and x["low"] <= stop) or (s.side == -1 and x["high"] >= stop):
+            px = min(x["open"], stop) if s.side == 1 else max(x["open"], stop)
+            exit_px, reason = px - s.side * slip, ("BE" if moved else "STOP")
             break
         if (s.side == 1 and x["high"] >= s.target) or (s.side == -1 and x["low"] <= s.target):
             exit_px, reason = s.target, "TARGET"
             break
+        if p.be_at_r and not moved:
+            fav = (x["high"] - fill) if s.side == 1 else (fill - x["low"])
+            if fav >= p.be_at_r * s.risk_ps:
+                stop, moved = fill, True        # effective from next bar
     if exit_px is None:
         exit_px, reason = post["close"].iloc[-1] - s.side * slip, "EOD"
     pnl_ps = s.side * (exit_px - fill)
