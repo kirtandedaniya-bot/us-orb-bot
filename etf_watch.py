@@ -1,6 +1,7 @@
-"""Daily ETF crash watch (read-only — never trades). Pings Discord when:
+"""Daily ETF watch (read-only — never trades). Pings Discord when:
   * SPY falls >= 3% in a day, or
-  * the ETF account crosses a drawdown level (5/10/15/20% below its peak) today.
+  * the ETF account crosses a drawdown level (5/10/15/20% below its peak) today, or
+  * good news: SPY +3% day, or a new account high crossing another +5% since start.
 The strategy itself still only acts on the monthly rebalance; this is information, not a sell signal.
 """
 import logging
@@ -23,7 +24,9 @@ log = logging.getLogger("etf_watch")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 notify.ENGINE = "ETF_MOMENTUM"
 LEVELS = (0.05, 0.10, 0.15, 0.20)
-SPY_DROP = -0.03
+SPY_DROP, SPY_POP = -0.03, 0.03
+START_EQUITY = float(os.getenv("ETF_START_EQUITY", "10000"))
+GAIN_STEP = 0.05                  # ping each time total return crosses another +5% (new high only)
 NOTE = ("No action needed: the bot only changes holdings on the monthly rebalance "
         "(downtrending funds rotate into SHY then). Backtest worst drop was −18.9%.")
 
@@ -49,6 +52,13 @@ def main() -> int:
     if crossed:
         msgs.append(f"ETF account is {today:.1%} below its peak (${max(eq):,.0f} → ${eq[-1]:,.0f}).")
 
+    good = []
+    hi_prev = max(eq[:-1]) if len(eq) > 1 else 0.0
+    if eq[-1] > hi_prev:              # new all-time high: did it cross a +5% milestone?
+        step = lambda x: int((x / START_EQUITY - 1) // GAIN_STEP)
+        if step(eq[-1]) > max(step(hi_prev), 0) and step(eq[-1]) >= 1:
+            good.append(f"New high: ETF account ${eq[-1]:,.0f}, {eq[-1] / START_EQUITY - 1:+.1%} since start.")
+
     data = StockHistoricalDataClient(k, s)
     bars = retry(lambda: data.get_stock_bars(StockBarsRequest(
         symbol_or_symbols="SPY", timeframe=TimeFrame.Day,
@@ -59,8 +69,13 @@ def main() -> int:
         log.info(f"SPY day {r:+.2%} | account dd {today:.2%} | equity ${eq[-1]:,.0f}")
         if r <= SPY_DROP:
             msgs.append(f"Market drop: SPY {r:+.1%} today.")
+        elif r >= SPY_POP:
+            good.append(f"Big up day: SPY {r:+.1%} today.")
     if msgs:
         notify.event("CRASH_WATCH", " ".join(msgs) + " " + NOTE, alert=True, color=notify.RED)
+    if good:
+        notify.event("GOOD_NEWS", " ".join(good) + " Nothing to do — the plan stays the same.",
+                     alert=True, color=notify.GREEN)
     return 0
 
 
