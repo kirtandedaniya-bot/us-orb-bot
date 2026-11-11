@@ -24,6 +24,8 @@ jobs:
       - name: Publish to orphan branch "data-sip"
         run: |
           cd /tmp/data
+          rm -f daily.parquet first5.parquet   # >100MB; backtest only needs selected.csv + intraday_*
+          ls -la
           git init -q -b data-sip
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
