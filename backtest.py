@@ -27,7 +27,7 @@ def run(rth: pd.DataFrame, p: Params, slip: float) -> pd.DataFrame:
     for sym, bars in rth.groupby("symbol"):
         dsym = daily[daily["symbol"] == sym].reset_index(drop=True)
         for i, (day, b) in enumerate(bars.groupby("date")):
-            prior = dsym[dsym["date"] < day].tail(60)
+            prior = dsym[dsym["date"] < day].tail(260)
             orb = b[(b["t"] >= p.orb_start) & (b["t"] < p.orb_end)]
             s = build_setup(sym, orb, prior, p)
             if s is None:
