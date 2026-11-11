@@ -30,4 +30,5 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
+          MAX_DRAWDOWN_USD: ${{ vars.MAX_DRAWDOWN_USD || '3800' }}
         run: python bot.py trade
