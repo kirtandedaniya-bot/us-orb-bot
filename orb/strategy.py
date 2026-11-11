@@ -22,7 +22,7 @@ class Params:
     risk_sweet: float = 150.0             # $ risk inside sweet spot
     risk_base: float = 50.0               # $ risk otherwise
     min_risk_ps: float = 0.02
-    target_r: float = 1.0
+    target_r: float = 1.5               # robust 1.25–2.0R plateau; 1.5R chosen (see PR)
     max_notional: float = 50_000.0        # per-position cap ($)
 
 
