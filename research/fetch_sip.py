@@ -10,7 +10,9 @@ Caveat: universe = stocks active today (survivorship bias: delisted names missin
 """
 import os
 import sys
+import threading
 import time as _t
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,14 +34,16 @@ OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "sip")
 KEY, SEC = os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
 data = StockHistoricalDataClient(KEY, SEC)
 _last = [0.0]
+_lock = threading.Lock()
 
 
 def bars(syms, tf, start, end) -> pd.DataFrame:
     for attempt in range(5):
-        wait = 0.31 - (_t.time() - _last[0])          # stay under 200 req/min
-        if wait > 0:
-            _t.sleep(wait)
-        _last[0] = _t.time()
+        with _lock:                                   # global pacing: <=180 req/min across threads
+            wait = 0.34 - (_t.time() - _last[0])
+            if wait > 0:
+                _t.sleep(wait)
+            _last[0] = _t.time()
         try:
             df = data.get_stock_bars(StockBarsRequest(symbol_or_symbols=syms, timeframe=tf, start=start, end=end,
                                                       feed=DataFeed.SIP, adjustment=Adjustment.SPLIT)).df
@@ -101,13 +105,11 @@ def _first5(csyms, days) -> pd.DataFrame:
         f = ck / f"{y}-{mo:02d}.parquet"
         if f.exists():
             continue
-        part = []
-        for day in [dy for dy in days if (dy.year, dy.month) == (y, mo)]:
-            s = datetime.combine(day, time(9, 30), NY)
-            for c in chunks(csyms, 400):
-                b = bars(c, tf5, s, s + timedelta(minutes=4))
-                if not b.empty:
-                    part.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        jobs = [(datetime.combine(day, time(9, 30), NY), c)
+                for day in days if (day.year, day.month) == (y, mo) for c in chunks(csyms, 400)]
+        with ThreadPoolExecutor(8) as ex:             # requests are latency-bound (~3s), not rate-bound
+            res = list(ex.map(lambda j: bars(j[1], tf5, j[0], j[0] + timedelta(minutes=4)), jobs))
+        part = [b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]] for b in res if not b.empty]
         if part:
             pd.concat(part).to_parquet(f, compression="zstd")
         print("first5 month", y, mo, flush=True)
@@ -140,12 +142,11 @@ def _rest(d, csyms, days) -> int:
         f = OUT / f"intraday_{ym}.parquet"
         if f.exists():
             continue
-        out = []
-        for day, grp in mgrp.groupby("date"):
-            s = datetime.combine(day, time(9, 30), NY)
-            b = bars(list(grp.symbol), TimeFrame.Minute, s, datetime.combine(day, time(15, 59), NY))
-            if not b.empty:
-                out.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        jobs = [(day, list(grp.symbol)) for day, grp in mgrp.groupby("date")]
+        with ThreadPoolExecutor(8) as ex:
+            res = list(ex.map(lambda j: bars(j[1], TimeFrame.Minute, datetime.combine(j[0], time(9, 30), NY),
+                                             datetime.combine(j[0], time(15, 59), NY)), jobs))
+        out = [b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]] for b in res if not b.empty]
         if out:
             intr = pd.concat(out)
             intr["timestamp"] = pd.to_datetime(intr["timestamp"])
