@@ -1,0 +1,131 @@
+"""Full-market 'stocks in play' dataset (Alpaca free SIP history, split-adjusted). Runs in GitHub Actions.
+
+Stage 1  assets      : active, tradable US equities on NYSE/NASDAQ/AMEX/ARCA/BATS
+Stage 2  daily       : daily bars for all of them -> ATR14, 14d avg volume, close (known pre-open via shift)
+Stage 3  first5      : 09:30 5-min bar for every symbol that is ever a candidate (price>$5, avgvol>1M, ATR>$0.50)
+Stage 4  selection   : RVOL = first5 volume / 14-day avg first5 volume; top 20 per day with RVOL >= 1
+Stage 5  intraday    : 1-min bars 09:30-16:00 for the selected symbol-days
+
+Caveat: universe = stocks active today (survivorship bias: delisted names missing).
+"""
+import os
+import sys
+import time as _t
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.requests import GetAssetsRequest
+
+NY = ZoneInfo("America/New_York")
+START = datetime(2023, 11, 1, tzinfo=timezone.utc)   # warm-up for 14-day stats before 2024
+END = datetime.now(timezone.utc) - timedelta(hours=1)
+OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "sip")
+KEY, SEC = os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
+data = StockHistoricalDataClient(KEY, SEC)
+_last = [0.0]
+
+
+def bars(syms, tf, start, end) -> pd.DataFrame:
+    for attempt in range(5):
+        wait = 0.31 - (_t.time() - _last[0])          # stay under 200 req/min
+        if wait > 0:
+            _t.sleep(wait)
+        _last[0] = _t.time()
+        try:
+            df = data.get_stock_bars(StockBarsRequest(symbol_or_symbols=syms, timeframe=tf, start=start, end=end,
+                                                      feed=DataFeed.SIP, adjustment=Adjustment.SPLIT)).df
+            return df.reset_index() if not df.empty else pd.DataFrame()
+        except Exception as e:
+            print("retry", attempt, str(e)[:120], flush=True)
+            _t.sleep(5 * (attempt + 1))
+    return pd.DataFrame()
+
+
+def chunks(xs, n):
+    return [xs[i:i + n] for i in range(0, len(xs), n)]
+
+
+def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
+    tc = TradingClient(KEY, SEC, paper=True)
+    assets = tc.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY))
+    syms = sorted(a.symbol for a in assets if a.tradable and str(a.exchange.value) in
+                  ("NYSE", "NASDAQ", "AMEX", "ARCA", "BATS") and "/" not in a.symbol)
+    print("assets", len(syms), flush=True)
+
+    # Stage 2: daily
+    parts = [bars(c, TimeFrame.Day, START, END) for c in chunks(syms, 200)]
+    d = pd.concat([p for p in parts if not p.empty])
+    d["date"] = pd.to_datetime(d["timestamp"]).dt.tz_convert(NY).dt.date
+    d = d.sort_values(["symbol", "date"])
+    g = d.groupby("symbol")
+    pc = g["close"].shift(1)
+    tr = np.maximum(d["high"] - d["low"], np.maximum((d["high"] - pc).abs(), (d["low"] - pc).abs()))
+    d["atr14"] = tr.groupby(d["symbol"]).transform(lambda x: x.rolling(14).mean().shift(1))
+    d["avgvol14"] = g["volume"].transform(lambda x: x.rolling(14).mean().shift(1))
+    d["prev_close"] = pc
+    d = d[["symbol", "date", "open", "high", "low", "close", "volume", "prev_close", "atr14", "avgvol14"]]
+    d.to_parquet(OUT / "daily.parquet", compression="zstd")
+    cand = d[(d.prev_close > 5) & (d.avgvol14 > 1e6) & (d.atr14 > 0.5)]
+    csyms = sorted(cand.symbol.unique())
+    days = sorted(cand.date.unique())
+    print("daily rows", len(d), "candidate symbols", len(csyms), "days", len(days), flush=True)
+
+    # Stage 3: first 5-min bar per day for all candidate symbols
+    f5 = []
+    tf5 = TimeFrame(5, TimeFrameUnit.Minute)
+    for i, day in enumerate(days):
+        s = datetime.combine(day, time(9, 30), NY)
+        for c in chunks(csyms, 400):
+            b = bars(c, tf5, s, s + timedelta(minutes=4))
+            if not b.empty:
+                f5.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        if i % 50 == 0:
+            print("first5 day", i, day, flush=True)
+    f5 = pd.concat(f5)
+    f5["date"] = pd.to_datetime(f5["timestamp"]).dt.tz_convert(NY).dt.date
+    f5 = f5[pd.to_datetime(f5["timestamp"]).dt.tz_convert(NY).dt.time == time(9, 30)]
+    f5 = f5.drop(columns="timestamp").sort_values(["symbol", "date"])
+    f5["avg_f5vol14"] = f5.groupby("symbol")["volume"].transform(lambda x: x.rolling(14).mean().shift(1))
+    f5["rvol"] = f5["volume"] / f5["avg_f5vol14"]
+    f5.to_parquet(OUT / "first5.parquet", compression="zstd")
+
+    # Stage 4: selection (filters use only pre-open info + the first 5 minutes)
+    m = f5.merge(d[["symbol", "date", "prev_close", "atr14", "avgvol14"]], on=["symbol", "date"])
+    m = m[(m.prev_close > 5) & (m.avgvol14 > 1e6) & (m.atr14 > 0.5) & (m.rvol >= 1)]
+    m["rank"] = m.groupby("date")["rvol"].rank(ascending=False, method="first")
+    sel = m[m["rank"] <= 20].sort_values(["date", "rank"])
+    sel.to_csv(OUT / "selected.csv", index=False)
+    print("selected symbol-days", len(sel), flush=True)
+
+    # Stage 5: 1-min bars for selected symbol-days
+    out = []
+    for i, (day, grp) in enumerate(sel.groupby("date")):
+        s = datetime.combine(day, time(9, 30), NY)
+        b = bars(list(grp.symbol), TimeFrame.Minute, s, datetime.combine(day, time(15, 59), NY))
+        if not b.empty:
+            out.append(b[["symbol", "timestamp", "open", "high", "low", "close", "volume"]])
+        if i % 50 == 0:
+            print("intraday day", i, day, flush=True)
+    intr = pd.concat(out)
+    intr["timestamp"] = pd.to_datetime(intr["timestamp"])
+    for c in ("open", "high", "low", "close", "volume"):
+        intr[c] = intr[c].astype("float32")
+    intr["year"] = intr["timestamp"].dt.year
+    for y, part in intr.groupby("year"):
+        part.drop(columns="year").to_parquet(OUT / f"intraday_{y}.parquet", compression="zstd")
+    print("intraday rows", len(intr), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
