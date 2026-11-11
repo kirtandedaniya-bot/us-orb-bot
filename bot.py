@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from orb import notify  # noqa: E402
+from orb import monitor, notify  # noqa: E402
 from orb.broker import Broker, retry  # noqa: E402
 from orb.strategy import Params, Setup, build_setup  # noqa: E402
 
@@ -279,6 +279,14 @@ def recap(b: Broker, today: date) -> None:
         else:
             lines.append(f"{o.symbol}: filled {entry:.2f}, closed by EOD flatten")
     body = f"Day P&L: **${pnl:+.2f}** | Equity ${float(acct.equity):,.2f}\n" + ("\n".join(lines) or "No fills")
+    try:
+        chk = monitor.sprt(monitor.live_r(b.trading))
+        body += "\n" + monitor.summary_line(chk)
+        if chk["state"] == "DEGRADED":
+            notify.event("EDGE_DEGRADED", monitor.summary_line(chk) + " — live results no longer match the "
+                         "backtest. Review before continuing.", alert=True, color=notify.RED)
+    except Exception as e:
+        log.warning("edge check failed: %s", e)
     notify.discord(f"US ORB recap {today}", body, notify.GREEN if pnl >= 0 else notify.RED)
 
 
