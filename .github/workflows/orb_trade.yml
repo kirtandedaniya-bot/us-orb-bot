@@ -2,9 +2,9 @@ name: US ORB - entries
 
 on:
   schedule:
-    # 09:45 ET (both crons cover EDT/EST; bot exits if outside window)
-    - cron: '45 13 * * 1-5'
-    - cron: '45 14 * * 1-5'
+    # ~09:30 ET; bot waits until 10:15. Second cron covers DST and gives a retry (orders are idempotent)
+    - cron: '30 13 * * 1-5'
+    - cron: '30 14 * * 1-5'
   workflow_dispatch:
 
 concurrency:
