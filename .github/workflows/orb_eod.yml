@@ -2,9 +2,9 @@ name: US ORB - EOD flatten + recap
 
 on:
   schedule:
-    # 15:35 ET
-    - cron: '35 19 * * 1-5'
-    - cron: '35 20 * * 1-5'
+    # ~15:05 ET; bot waits in-job until 15:50 ET (absorbs GitHub schedule delays)
+    - cron: '5 19 * * 1-5'
+    - cron: '5 20 * * 1-5'
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   run:
-    timeout-minutes: 15
+    timeout-minutes: 80
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
