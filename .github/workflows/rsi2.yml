@@ -1,0 +1,46 @@
+name: RSI-2 SPY - evening signal (market-on-open orders)
+
+on:
+  schedule:
+    - cron: '15 0 * * 2-6'    # Mon-Fri evenings: 19:15 ET (EST) / 20:15 ET (EDT) — primary
+    - cron: '15 3 * * 2-6'    # backup: 22:15 / 23:15 ET
+    - cron: '45 11 * * 1-5'   # pre-open backup: 06:45 / 07:45 ET (also handles Monday after weekends)
+    - cron: '0 22 * * 5'      # Friday weekly status to Discord
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal | dry-run | status'
+        default: 'dry-run'
+
+concurrency:
+  group: rsi2
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run
+        env:
+          RSI2_ALPACA_API_KEY: ${{ secrets.RSI2_ALPACA_API_KEY }}
+          RSI2_ALPACA_SECRET_KEY: ${{ secrets.RSI2_ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RSI2_TRADING_ENABLED: ${{ vars.RSI2_TRADING_ENABLED || 'true' }}
+        run: |
+          if [ -z "$RSI2_ALPACA_API_KEY" ]; then
+            echo "RSI2 paper account keys not set yet — skipping"; exit 0
+          fi
+          if [ "${{ github.event.schedule }}" = "0 22 * * 5" ]; then python rsi2_bot.py --status; exit $?; fi
+          case "${{ github.event.inputs.mode }}" in
+            dry-run) python rsi2_bot.py --dry-run ;;
+            status)  python rsi2_bot.py --status ;;
+            *)       python rsi2_bot.py ;;
+          esac
