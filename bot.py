@@ -252,6 +252,13 @@ def own_positions(b: Broker) -> list:
     return [p for p in retry(b.trading.get_all_positions, "positions") if p.symbol in UNIVERSE]
 
 
+def open_entries(b: Broker) -> list:
+    """Open orders belonging to this bot (unfilled entries or bracket legs)."""
+    open_ = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)),
+                  "open orders")
+    return [o for o in open_ if (o.client_order_id or "").startswith(f"{CID}-") or o.symbol in UNIVERSE]
+
+
 def flatten(b: Broker) -> list:
     for attempt in range(1, 4):
         open_ = retry(lambda: b.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)),
@@ -322,6 +329,20 @@ def mode_eod(b: Broker) -> int:
     # GitHub cron can start 40-60 min late, so the job is scheduled ~45 min early and waits here
     if now < flat_at - timedelta(minutes=75):
         log.info("Too early for EOD (close %s) — exit", close.strftime("%H:%M")); return 0
+    marker = os.getenv("EOD_MARKER", "")
+    done_today = bool(marker) and os.path.exists(marker)
+    if not positions and not open_entries(b):
+        # Nothing open and nothing that can still fill: the day is final — no need to sit and wait
+        # (saves ~60 GitHub Actions minutes/day). Recap once per day (marker restored from actions cache).
+        if done_today:
+            log.info("Recap already sent today, nothing open — exit"); return 0
+        if now < datetime.combine(now.date(), P.entry_deadline, NY) + timedelta(minutes=5):
+            log.info("Entries could still be pending — exit, a later run will recap"); return 0
+        if sess and now.date() == sess[1].date():
+            recap(b, now.date())
+            if marker:
+                open(marker, "w").write(now.isoformat())
+        return 0
     if now < flat_at:
         log.info("Waiting until %s ET to flatten", flat_at.strftime("%H:%M"))
         sleep_until(flat_at)
@@ -339,8 +360,10 @@ def mode_eod(b: Broker) -> int:
     if positions:
         notify.event("SYSTEM_FLATTEN", f"Flattened {len(positions)} positions" + (" (AFTER CLOSE)" if late else ""),
                      alert=True, color=notify.RED if late else notify.ORANGE)
-    if not late and sess:
+    if not late and sess and not done_today:
         recap(b, now.date())
+        if marker:
+            open(marker, "w").write(now.isoformat())
     return 0
 
 

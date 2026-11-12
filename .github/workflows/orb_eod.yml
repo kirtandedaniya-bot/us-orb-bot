@@ -22,6 +22,13 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - id: d
+        run: echo "day=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore once-per-day recap marker
+        uses: actions/cache/restore@v4
+        with:
+          path: .eod_marker
+          key: orb-eod-${{ steps.d.outputs.day }}
       - name: Run
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -29,4 +36,12 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
+          EOD_MARKER: .eod_marker
         run: python bot.py eod
+      - name: Save recap marker
+        if: always() && hashFiles('.eod_marker') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .eod_marker
+          key: orb-eod-${{ steps.d.outputs.day }}
