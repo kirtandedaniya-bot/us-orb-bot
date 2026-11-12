@@ -31,7 +31,7 @@ NY = ZoneInfo("America/New_York")
 UNIVERSE = os.getenv("UNIVERSE", "AAPL,MSFT,NVDA,QQQ").split(",")
 P = Params()
 CID = "orb"                       # client_order_id prefix: orb-YYYYMMDD-SYM
-TRADE_WINDOW = (time(9, 25), time(10, 40))  # cron fires ~09:30 ET; GitHub delays tolerated
+TRADE_WINDOW = (time(8, 0), time(10, 40))   # several crons 08:00-10:30 ET; early runs sleep to 10:15
 CANCEL_WINDOW = (time(11, 30), time(12, 29))
 MAX_CHASE_R = 0.5                 # skip if price already > 0.5R past the trigger
 # Monte Carlo (research/robustness.py): 99th-pct max drawdown over 2024-26 was ~$3.8k.
@@ -187,7 +187,7 @@ def mode_trade(b: Broker) -> int:
     today = now.date()
 
     held = {p.symbol for p in own_positions(b)}
-    if held:
+    if held and now.time() < time(10, 15):   # after 10:15 these are today's fills (duplicate run), not leftovers
         notify.event("LEFTOVER_POSITIONS", f"Open before entry: {held} — excluded. Check EOD job!",
                      alert=True, color=notify.RED)
     symbols = [s for s in UNIVERSE if s not in held]
@@ -229,7 +229,7 @@ def mode_trade(b: Broker) -> int:
 def mode_cancel(b: Broker) -> int:
     now = now_ny()
     start = datetime.combine(now.date(), CANCEL_WINDOW[0], NY)
-    if start - timedelta(minutes=45) <= now < start:   # cron arrived early-ish after GitHub delay: wait
+    if start - timedelta(minutes=150) <= now < start:  # early cron (public repo: minutes are free): wait
         log.info("Waiting until %s ET to cancel", CANCEL_WINDOW[0].strftime("%H:%M"))
         sleep_until(start); now = now_ny()
     if not in_window(now.time(), CANCEL_WINDOW):
@@ -327,7 +327,7 @@ def mode_eod(b: Broker) -> int:
     close = sess[1] if sess else datetime.combine(now.date(), time(16, 0), NY)
     flat_at = close - timedelta(minutes=10)
     # GitHub cron can start 40-60 min late, so the job is scheduled ~45 min early and waits here
-    if now < flat_at - timedelta(minutes=75):
+    if now < flat_at - timedelta(minutes=150):
         log.info("Too early for EOD (close %s) — exit", close.strftime("%H:%M")); return 0
     marker = os.getenv("EOD_MARKER", "")
     done_today = bool(marker) and os.path.exists(marker)

@@ -2,8 +2,10 @@ name: US ORB - expire entries
 
 on:
   schedule:
-    # 11:31 ET
+    # staggered; early runs wait for 11:30 ET
+    - cron: '0 15 * * 1-5'
     - cron: '31 15 * * 1-5'
+    - cron: '0 16 * * 1-5'
     - cron: '31 16 * * 1-5'
   workflow_dispatch:
 
@@ -13,7 +15,7 @@ concurrency:
 
 jobs:
   run:
-    timeout-minutes: 10
+    timeout-minutes: 160
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

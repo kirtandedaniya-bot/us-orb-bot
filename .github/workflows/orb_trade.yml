@@ -2,8 +2,10 @@ name: US ORB - entries
 
 on:
   schedule:
-    # ~09:30 ET; bot waits until 10:15. Second cron covers DST and gives a retry (orders are idempotent)
+    # 4 staggered crons (08:00-09:30 ET in winter, 09:00-10:30 in summer); first to arrive sleeps to 10:15, rest are idempotent
+    - cron: '0 13 * * 1-5'
     - cron: '30 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
     - cron: '30 14 * * 1-5'
   workflow_dispatch:
 
@@ -13,7 +15,7 @@ concurrency:
 
 jobs:
   run:
-    timeout-minutes: 120
+    timeout-minutes: 180
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
