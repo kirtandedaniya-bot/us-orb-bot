@@ -34,7 +34,13 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           RSI2_TRADING_ENABLED: ${{ vars.RSI2_TRADING_ENABLED || 'true' }}
+          ORB_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ORB_SECRET: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
+          if [ -z "$RSI2_ALPACA_API_KEY" ] && [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
+            echo "No RSI2 keys: dry run reads data with the ORB account keys (no orders possible in dry-run)"
+            export RSI2_ALPACA_API_KEY="$ORB_KEY" RSI2_ALPACA_SECRET_KEY="$ORB_SECRET"
+          fi
           if [ -z "$RSI2_ALPACA_API_KEY" ]; then
             echo "RSI2 paper account keys not set yet — skipping"; exit 0
           fi
