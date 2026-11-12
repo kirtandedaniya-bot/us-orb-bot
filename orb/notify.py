@@ -15,7 +15,7 @@ def discord(title: str, msg: str, color: int = GREEN) -> None:
     if not WEBHOOK:
         return
     body = json.dumps({"embeds": [{"title": title, "description": msg[:4000], "color": color,
-                                   "footer": {"text": "US ORB v2"}}]}).encode()
+                                   "footer": {"text": {"US_ALPACA": "US ORB v2", "ETF_MOMENTUM": "ETF momentum", "RSI2_SPY": "RSI-2 SPY"}.get(ENGINE, ENGINE)}}]}).encode()
     req = urllib.request.Request(WEBHOOK, data=body,
                                  headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
     try:

@@ -85,6 +85,7 @@ def closes(data, signal_day: date) -> pd.Series:
     df["date"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(NY).dt.date
     s = df.set_index("date")["close"].astype(float).sort_index()
     s = s[~s.index.duplicated(keep="last")]
+    s = s[s.index <= signal_day]          # drop today's partial bar if the session is still running
     if s.empty or s.index[-1] != signal_day:
         raise RuntimeError(f"daily bar for {signal_day} not available yet (last {s.index[-1] if len(s) else None})")
     jump = (s / s.shift(1) - 1).abs().max()
