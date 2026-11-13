@@ -79,7 +79,9 @@ def sessions(tc, now: datetime) -> tuple[date, date, datetime, datetime]:
 def closes(data, signal_day: date) -> pd.Series:
     req = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame.Day,
                            start=datetime.combine(signal_day - timedelta(days=HISTORY_DAYS), time(0), NY),
-                           end=datetime.combine(signal_day + timedelta(days=1), time(0), NY),
+                           # free data plan: SIP requests must end >15 min in the past
+                           end=min(datetime.combine(signal_day + timedelta(days=1), time(0), NY),
+                                   datetime.now(NY) - timedelta(minutes=16)),
                            feed=DataFeed.SIP, adjustment=Adjustment.ALL)
     df = retry(lambda: data.get_stock_bars(req).df, "daily bars").reset_index()
     df["date"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(NY).dt.date
