@@ -148,6 +148,8 @@ def submit(b: Broker, s: Setup, cid_: str, market: bool) -> str:
             return "dup"
         if not market and ("bracket" in m or "order type" in m or "not supported" in m):
             return "unsupported"
+        if not market and "stop price must be" in m:
+            return "crossed"     # price already through the trigger: handled by caller (backtest fills at market)
         notify.event("ORDER_REJECTED", f"{s.symbol}: {e}", alert=True, color=notify.RED)
         return "error"
     except Exception as e:
@@ -206,7 +208,19 @@ def mode_trade(b: Broker) -> int:
             notify.event("SKIP_CHASE", f"{s.symbol} already {p} vs trigger {s.level}"); continue
         if s.side == -1 and not shortable(b, s.symbol):
             notify.event("NOT_SHORTABLE", s.symbol); continue
-        r = submit(b, s, cid(today, s.symbol), market=False)
+        crossed = p is not None and s.side * (p - s.level) >= 0
+        r = "crossed" if crossed else submit(b, s, cid(today, s.symbol), market=False)
+        if r == "crossed":
+            # Backtest rule: if the trigger is already hit, fill at the next price (max/min of open, level),
+            # provided it is within the chase limit and still inside the bracket.
+            p = b.last_price([s.symbol]).get(s.symbol, p)
+            inside = p is not None and ((s.stop < p < s.target) if s.side == 1 else (s.target < p < s.stop))
+            if not inside or s.side * (p - s.level) > MAX_CHASE_R * s.risk_ps:
+                notify.event("SKIP_CHASE", f"{s.symbol} already {p} vs trigger {s.level} — outside chase/bracket")
+                continue
+            r = submit(b, s, cid(today, s.symbol), market=True)
+            if r == "ok":
+                notify.event("ENTRY_FIRED", f"{s.symbol} trigger already crossed — market bracket @~{p}", alert=True)
         if r == "ok":
             placed.append(s)
             notify.trade(symbol=s.symbol, direction="LONG" if s.side == 1 else "SHORT", regime=s.trend,
