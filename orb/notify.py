@@ -30,7 +30,7 @@ CALL_KINDS = {"FATAL", "DRAWDOWN_BREAKER", "EDGE_DEGRADED", "FLATTEN_FAILED", "L
 BOT_NAME = {"US_ALPACA": "O R B bot", "ETF_MOMENTUM": "E T F bot", "RSI2_SPY": "R S I 2 bot"}
 
 
-def phone_call(text: str, attempts: int = 4) -> bool:
+def phone_call(text: str, attempts: int = 2) -> bool:
     """Telegram voice call that reads `text` aloud (CallMeBot, free). No-op unless CALLMEBOT_USER is set.
     The free service sometimes answers FLOOD/busy: retry with back-off. Returns True if the call started."""
     user = os.getenv("CALLMEBOT_USER", "").strip()
@@ -43,7 +43,7 @@ def phone_call(text: str, attempts: int = 4) -> bool:
     for i in range(attempts):
         try:
             r = urllib.request.urlopen(urllib.request.Request(f"https://api.callmebot.com/start.php?{q}",
-                                                              headers={"User-Agent": "Mozilla/5.0"}), timeout=90)
+                                                              headers={"User-Agent": "Mozilla/5.0"}), timeout=45)
             body = " ".join(re.sub(r"<[^>]+>", " ", r.read().decode("utf-8", "replace")).split())
             busy = any(w in body.upper() for w in ("FLOOD", "BUSY", "SKIPPED", "ERROR"))
             log.info("phone call attempt %d: %s", i + 1, body[body.find("Starting"):][:200] or body[:200])
@@ -51,7 +51,8 @@ def phone_call(text: str, attempts: int = 4) -> bool:
                 return True
         except Exception as e:
             log.warning("phone call attempt %d failed: %s", i + 1, e)
-        time.sleep(60 * (i + 1))
+        if i + 1 < attempts:
+            time.sleep(20)
     log.warning("phone call gave up after %d attempts", attempts)
     return False
 
