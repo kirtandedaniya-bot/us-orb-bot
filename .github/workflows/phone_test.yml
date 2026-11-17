@@ -1,0 +1,20 @@
+name: Test - phone call alert
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Ring the phone
+        env:
+          CALLMEBOT_USER: ${{ secrets.CALLMEBOT_USER }}
+        run: |
+          if [ -z "$CALLMEBOT_USER" ]; then echo "CALLMEBOT_USER secret not set"; exit 1; fi
+          python -c "import logging; logging.basicConfig(level=logging.INFO); from orb import notify; notify.phone_call('Hey Kirtan, this is your trading bot. Test call. Phone alerts are working.')"

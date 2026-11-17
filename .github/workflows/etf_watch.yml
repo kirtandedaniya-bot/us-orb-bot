@@ -21,5 +21,6 @@ jobs:
           ETF_ALPACA_API_KEY: ${{ secrets.ETF_ALPACA_API_KEY }}
           ETF_ALPACA_SECRET_KEY: ${{ secrets.ETF_ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CALLMEBOT_USER: ${{ secrets.CALLMEBOT_USER }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python etf_watch.py

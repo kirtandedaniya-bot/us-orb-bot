@@ -32,6 +32,7 @@ jobs:
           RSI2_ALPACA_API_KEY: ${{ secrets.RSI2_ALPACA_API_KEY }}
           RSI2_ALPACA_SECRET_KEY: ${{ secrets.RSI2_ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CALLMEBOT_USER: ${{ secrets.CALLMEBOT_USER }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           RSI2_TRADING_ENABLED: ${{ vars.RSI2_TRADING_ENABLED || 'true' }}
           ORB_KEY: ${{ secrets.ALPACA_API_KEY }}

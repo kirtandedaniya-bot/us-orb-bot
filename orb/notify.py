@@ -24,6 +24,27 @@ def discord(title: str, msg: str, color: int = GREEN) -> None:
         log.warning("discord failed: %s", e)
 
 
+# Serious events also ring the owner's phone (Telegram voice call via CallMeBot, free).
+CALL_KINDS = {"FATAL", "DRAWDOWN_BREAKER", "EDGE_DEGRADED", "FLATTEN_FAILED", "LEFTOVER_POSITIONS",
+              "UNEXPECTED_POSITIONS", "ORDER_PROBLEM", "CRASH_WATCH"}
+BOT_NAME = {"US_ALPACA": "O R B bot", "ETF_MOMENTUM": "E T F bot", "RSI2_SPY": "R S I 2 bot"}
+
+
+def phone_call(text: str) -> None:
+    """Telegram voice call that reads `text` aloud. No-op unless CALLMEBOT_USER (e.g. @name) is set."""
+    user = os.getenv("CALLMEBOT_USER", "").strip()
+    if not user:
+        return
+    import urllib.parse
+    q = urllib.parse.urlencode({"user": user, "text": text[:240], "lang": "en-GB-Standard-B"})
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"https://api.callmebot.com/start.php?{q}",
+                                                      headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
+        log.info("phone call requested")
+    except Exception as e:
+        log.warning("phone call failed: %s", e)
+
+
 def event(kind: str, msg: str, alert: bool = False, color: int = GREY) -> None:
     log.info("[%s] %s", kind, msg)
     try:
@@ -33,6 +54,9 @@ def event(kind: str, msg: str, alert: bool = False, color: int = GREY) -> None:
         log.warning("db event failed: %s", e)
     if alert:
         discord(kind, msg, color)
+    if kind in CALL_KINDS:
+        phone_call(f"Alert from your {BOT_NAME.get(ENGINE, 'trading bot')}. {kind.replace('_', ' ').lower()}. "
+                   f"{msg}. Check Discord.")
 
 
 def trade(**kw) -> None:
