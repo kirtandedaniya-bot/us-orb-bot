@@ -38,9 +38,11 @@ def phone_call(text: str) -> None:
     import urllib.parse
     q = urllib.parse.urlencode({"user": user, "text": text[:240], "lang": "en-GB-Standard-B"})
     try:
-        urllib.request.urlopen(urllib.request.Request(f"https://api.callmebot.com/start.php?{q}",
-                                                      headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
-        log.info("phone call requested")
+        r = urllib.request.urlopen(urllib.request.Request(f"https://api.callmebot.com/start.php?{q}",
+                                                          headers={"User-Agent": "Mozilla/5.0"}), timeout=60)
+        import re
+        body = re.sub(r"<[^>]+>", " ", r.read().decode("utf-8", "replace"))
+        log.info("phone call requested: %s", " ".join(body.split())[:300])
     except Exception as e:
         log.warning("phone call failed: %s", e)
 
