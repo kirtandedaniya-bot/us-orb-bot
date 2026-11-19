@@ -45,7 +45,9 @@ def phone_call(text: str, attempts: int = 2) -> bool:
             r = urllib.request.urlopen(urllib.request.Request(f"https://api.callmebot.com/start.php?{q}",
                                                               headers={"User-Agent": "Mozilla/5.0"}), timeout=45)
             body = " ".join(re.sub(r"<[^>]+>", " ", r.read().decode("utf-8", "replace")).split())
-            busy = any(w in body.upper() for w in ("FLOOD", "BUSY", "SKIPPED", "ERROR"))
+            up = body.upper()
+            # "Line is busy (call queued)" is a success: CallMeBot rings a few seconds later
+            busy = "QUEUED" not in up and any(w in up for w in ("FLOOD", "BUSY", "SKIPPED", "ERROR"))
             log.info("phone call attempt %d: %s", i + 1, body[body.find("Starting"):][:200] or body[:200])
             if not busy:
                 return True
