@@ -5,7 +5,7 @@ Flow (after each US close):
   1. find the last completed session (signal day) and the next session (execution day)
   2. pull official adjusted daily closes incl. the signal day; sanity-check them
   3. decide hold/flat for the next session from the current SPY position
-  4. if it changes: submit a market-on-open (OPG) order for the next open, id rsi2-YYYYMMDD-buy|sell
+  4. if it changes: submit a market DAY order (queued to the next open), id rsi2-YYYYMMDD-buy|sell[-rN]
 Safety: idempotent client_order_id, kill switch, separate account, stale/short data refusal, buying-power
 check, only ever touches SPY, never shorts, alerts on anything unexpected.
 
@@ -44,8 +44,6 @@ notify.ENGINE = "RSI2_SPY"
 NY = ZoneInfo("America/New_York")
 SYMBOL = "SPY"
 INVEST_FRACTION = 0.97          # buffer for an opening gap up between the close and the open
-OPG_OPEN = time(19, 0)          # Alpaca accepts OPG orders after 19:00 ET ...
-OPG_CUTOFF = time(9, 28)        # ... and before 09:28 ET of the next session
 CLOSE_GRACE = timedelta(minutes=20)
 HISTORY_DAYS = 600              # ~410 sessions; parity verified identical to full history
 
@@ -115,6 +113,13 @@ def existing_order(tc, tag: str):
     return next((o for o in orders if (o.client_order_id or "").startswith(tag)), None)
 
 
+def orders_with_prefix(tc, prefix: str) -> list:
+    orders = retry(lambda: tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=[SYMBOL],
+                                                          after=datetime.now(NY) - timedelta(days=10),
+                                                          limit=200)), "orders")
+    return [o for o in orders if (o.client_order_id or "").startswith(prefix)]
+
+
 def last_rsi2_order(tc):
     orders = retry(lambda: tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=[SYMBOL],
                                                           after=datetime.now(NY) - timedelta(days=60),
@@ -157,24 +162,36 @@ def run(dry: bool = False, status: bool = False) -> int:
         notify.event("KILL_SWITCH", f"RSI2_TRADING_ENABLED=false — skipped {side.value} | {info}", alert=True,
                      color=notify.AMBER)
         return 0
-    prev = existing_order(tc, tag)
-    if prev:
-        st = prev.status.value
-        if st in ("rejected", "canceled", "expired"):
-            notify.event("ORDER_PROBLEM", f"{tag} is {st} — not resubmitting automatically | {info}", alert=True,
-                         color=notify.RED)
-        else:
-            log.info("%s already submitted (%s) — exit", tag, st)
-        return 0
+    # Orders for this execution day (base tag or retries tag-r1, tag-r2 ...)
+    mine = orders_with_prefix(tc, tag)
+    bad = ("rejected", "canceled", "expired")
+    in_session = next_open <= now < next_close
+    cancelled_now = set()
+    for o in mine:
+        st = o.status.value
+        if st in bad or st == "filled":
+            continue
+        if o.time_in_force == TimeInForce.OPG and not in_session:
+            # legacy market-on-open order: Alpaca paper cancels these unfilled → replace with a queued DAY order
+            retry(lambda: tc.cancel_order_by_id(o.id), "cancel OPG")
+            cancelled_now.add(str(o.id))
+            log.info("cancelled legacy OPG order %s", o.client_order_id)
+            continue
+        log.info("%s already submitted (%s) — exit", o.client_order_id, st); return 0
 
-    # timing: OPG only 19:00 → 09:28 ET; if the next session is already open we are late
-    if next_open <= now < next_close:
-        tif, late = TimeInForce.DAY, True
-    elif (now.time() >= OPG_OPEN and (next_day - now.date()).days == 1) or \
-            (now.date() == next_day and now.time() < OPG_CUTOFF):
-        tif, late = TimeInForce.OPG, False      # evening before the next session, or its pre-open morning
-    else:
-        log.info("Not an OPG window (daytime / weekend / holiday gap) — a later run will submit"); return 0
+    # Did the previous attempt fail? (alert once: only when we are about to resubmit)
+    prior = orders_with_prefix(tc, f"rsi2-{signal_day:%Y%m%d}-{side.value}")
+    prev_fail = [o for o in prior + mine if o.status.value in bad and str(o.id) not in cancelled_now]
+    if prev_fail:
+        names = ", ".join(f"{o.client_order_id} {o.status.value}" for o in prev_fail)
+        notify.event("ORDER_PROBLEM", f"RSI-2 earlier order not filled ({names}) — resubmitting | {info}", alert=True,
+                     color=notify.RED)
+    if mine:
+        tag = f"{tag}-r{len(mine)}"
+
+    # Market DAY order: during the session it fills now (late run); outside the session Alpaca queues it
+    # for the next open — same fill as the backtest (next open).
+    tif, late = TimeInForce.DAY, in_session
 
     if side == OrderSide.BUY:
         acct = retry(tc.get_account, "account")
