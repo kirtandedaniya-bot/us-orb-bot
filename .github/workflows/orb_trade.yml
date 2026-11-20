@@ -32,5 +32,5 @@ jobs:
           CALLMEBOT_USER: ${{ secrets.CALLMEBOT_USER }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
-          MAX_DRAWDOWN_USD: ${{ vars.MAX_DRAWDOWN_USD || '3800' }}
+          MAX_DRAWDOWN_USD: ${{ vars.MAX_DRAWDOWN_USD || '1000' }}
         run: python bot.py trade

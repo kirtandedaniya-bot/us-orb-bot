@@ -36,7 +36,7 @@ CANCEL_WINDOW = (time(11, 30), time(12, 29))
 MAX_CHASE_R = 0.5                 # skip if price already > 0.5R past the trigger
 # Monte Carlo (research/robustness.py): 99th-pct max drawdown over 2024-26 was ~$3.8k.
 # A deeper drawdown means live results no longer match the backtest -> stop and investigate.
-MAX_DRAWDOWN_USD = float(os.getenv("MAX_DRAWDOWN_USD", "3800"))
+MAX_DRAWDOWN_USD = float(os.getenv("MAX_DRAWDOWN_USD", "1000"))  # 10% of the virtual $10k
 OPEN_STATES = {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW, OrderStatus.HELD}
 
 

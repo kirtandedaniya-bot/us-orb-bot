@@ -19,11 +19,11 @@ class Params:
     atr_hi: float = 60.0
     sweet_lo: float = 30.0
     sweet_hi: float = 45.0
-    risk_sweet: float = 150.0             # $ risk inside sweet spot
-    risk_base: float = 50.0               # $ risk otherwise
+    risk_sweet: float = 100.0             # $ risk inside sweet spot (sized as a $10k account, 1%)
+    risk_base: float = 35.0               # $ risk otherwise (0.35% of $10k)
     min_risk_ps: float = 0.02
     target_r: float = 1.5               # robust 1.25–2.0R plateau; 1.5R chosen (see PR)
-    max_notional: float = 50_000.0        # per-position cap ($)
+    max_notional: float = 20_000.0        # per-position cap ($): 2x a $10k account
     # research switches (defaults = live behaviour)
     trend_len: int = 20                   # SMA length for trend filter (0 = no filter: both sides allowed)
     stop_mode: str = "vwap"               # "vwap" | "mid" (ORB midpoint)
