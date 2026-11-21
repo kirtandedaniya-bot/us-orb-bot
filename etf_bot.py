@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 notify.ENGINE = "ETF_MOMENTUM"
 
 NY = ZoneInfo("America/New_York")
-RISK = ["SPY", "IWM", "EFA", "EEM", "VNQ", "GLD", "DBC", "TLT", "IEF", "LQD"]
+RISK = ["SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "GLD", "DBC", "TLT", "IEF", "LQD"]  # QQQ added 2026-11-21 (test: CAGR 9.8→10.7%, MaxDD −18.9→−17.2%)
 CASH = "SHY"
 TOP = 3
 SMA_MONTHS = 10
@@ -167,7 +167,18 @@ def rebalance(dry: bool = False, force: bool = False) -> int:
                 notify.event("ORDER_REJECTED", f"buy {s} x{q}: {e}", alert=True, color=notify.RED)
     if not trades:   # still mark the month as done
         log.info("No trades; nothing submitted")
-    notify.discord(f"ETF momentum rebalance {today:%b %Y}", msg, notify.GREEN)
+    names = {"SPY": "US big companies", "QQQ": "US tech", "IWM": "US small companies", "EFA": "international stocks",
+             "EEM": "emerging markets", "VNQ": "real estate", "GLD": "gold", "DBC": "commodities",
+             "TLT": "long-term US bonds", "IEF": "medium-term US bonds", "LQD": "company bonds",
+             "SHY": "short-term bonds (safe cash spot)"}
+    hold = ", ".join(f"{k} ({names.get(k, k)})" for k in weights)
+    sold = [s for s, q in trades.items() if q < 0 and target[s] == 0]
+    bought = [s for s, q in trades.items() if q > 0 and held.get(s, 0) == 0]
+    simple = (f"Monthly check done. The bot now holds: {hold}. These were the strongest over the last 3-12 months."
+              + (f" Sold: {', '.join(sold)}." if sold else "") + (f" Bought: {', '.join(bought)}." if bought else "")
+              + ("" if trades else " Nothing needed changing.")
+              + " Next check: the first trading day of next month.")
+    notify.discord(f"ETF momentum rebalance {today:%b %Y}", msg, notify.GREEN, plain=simple)
     notify.event("REBALANCE", msg.replace("\n", " | "))
     return 0
 

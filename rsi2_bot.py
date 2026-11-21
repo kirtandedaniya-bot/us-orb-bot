@@ -43,7 +43,9 @@ notify.ENGINE = "RSI2_SPY"
 
 NY = ZoneInfo("America/New_York")
 SYMBOL = "SPY"
-INVEST_FRACTION = 0.97          # buffer for an opening gap up between the close and the open
+INVEST_FRACTION = 0.97
+CASH_ETF = "BIL"                # SPDR 1-3 month T-bill ETF: where idle cash waits
+MIN_CASH_TRADE = 0.05           # skip BIL trades smaller than 5% of equity          # buffer for an opening gap up between the close and the open
 CLOSE_GRACE = timedelta(minutes=20)
 HISTORY_DAYS = 600              # ~410 sessions; parity verified identical to full history
 
@@ -96,7 +98,7 @@ def closes(data, signal_day: date) -> pd.Series:
 
 def spy_qty(tc) -> float:
     pos = retry(tc.get_all_positions, "positions")
-    others = [p.symbol for p in pos if p.symbol != SYMBOL]
+    others = [p.symbol for p in pos if p.symbol not in (SYMBOL, CASH_ETF)]
     if others:
         notify.event("UNEXPECTED_POSITIONS", f"RSI-2 account holds {others} — left untouched", alert=True,
                      color=notify.AMBER)
@@ -149,8 +151,24 @@ def run(dry: bool = False, status: bool = False) -> int:
         acct = retry(tc.get_account, "account")
         last = last_rsi2_order(tc)
         lo = f"last order {last.client_order_id} ({last.status.value})" if last else "no orders yet"
-        notify.discord("RSI-2 weekly status", f"{info}\nEquity ${float(acct.equity):,.2f} | {lo}", notify.GREY)
+        if held:
+            simple = (f"Holding SPY, waiting for it to bounce above ${x['sma5']:.2f} (its 5-day average) to sell. "
+                      f"SPY closed at ${x['close']:.2f}.")
+        else:
+            simple = (f"Not holding SPY — waiting for a sharp dip (RSI below 10, now {x['rsi2']:.0f}) while SPY is above "
+                      f"its 200-day average (${x['sma200']:.2f}). Idle cash sits in T-bills (BIL) earning interest.")
+        simple += f" Account: ${float(acct.equity):,.2f}."
+        notify.discord("RSI-2 weekly status", f"{info}\nEquity ${float(acct.equity):,.2f} | {lo}", notify.GREY,
+                       plain=simple)
         return 0
+    rc = spy_leg(tc, now, signal_day, next_day, next_open, next_close, x, qty, held, hold_next, info, dry)
+    if not dry and os.getenv("RSI2_TRADING_ENABLED", "true").lower() != "false":
+        park_cash(tc, data, now, signal_day, next_day, next_open, next_close, hold_next, held)
+    return rc
+
+
+def spy_leg(tc, now, signal_day, next_day, next_open, next_close, x, qty, held, hold_next, info, dry) -> int:
+    """Submit the SPY buy/sell for the next open if the rule says the position changes."""
     if hold_next == held:
         log.info("No change — nothing to do"); return 0
 
@@ -211,9 +229,63 @@ def run(dry: bool = False, status: bool = False) -> int:
         return 1
     when = "at market NOW (late run)" if late else f"at the {next_day:%a %d %b} open"
     title = f"RSI-2: {'BUY' if side == OrderSide.BUY else 'SELL'} {q} SPY {when}"
-    notify.discord(title, f"{info}\nOrder {o.id} ({tag})", notify.ORANGE if late else notify.GREEN)
+    if side == OrderSide.BUY:
+        simple = (f"SPY (the S&P 500) has dropped sharply over the last few days, so the bot is buying {q} shares "
+                  f"{'right now' if late else 'when the market opens'}, betting on a bounce. It sells once SPY "
+                  f"closes above ${x['sma5']:.2f} (its 5-day average) — usually within a few days.")
+    else:
+        simple = (f"SPY has bounced back above its 5-day average, so the bot sells its {q} shares "
+                  f"{'right now' if late else 'when the market opens'} and parks the money in T-bills (BIL) "
+                  f"to earn interest until the next dip.")
+    notify.discord(title, f"{info}\nOrder {o.id} ({tag})", notify.ORANGE if late else notify.GREEN, plain=simple)
     notify.event("ORDER", f"{title} | {info}")
     return 0
+
+
+
+def bil_close(data, signal_day: date) -> float:
+    req = StockBarsRequest(symbol_or_symbols=CASH_ETF, timeframe=TimeFrame.Day,
+                           start=datetime.combine(signal_day - timedelta(days=10), time(0), NY),
+                           end=min(datetime.combine(signal_day + timedelta(days=1), time(0), NY),
+                                   datetime.now(NY) - timedelta(minutes=16)),
+                           feed=DataFeed.SIP, adjustment=Adjustment.ALL)
+    df = retry(lambda: data.get_stock_bars(req).df, "BIL bars")
+    return float(df["close"].iloc[-1])
+
+
+def park_cash(tc, data, now, signal_day, next_day, next_open, next_close, hold_next, held) -> None:
+    """Idle cash earns T-bill interest: hold BIL whenever SPY is not wanted (backtest: CAGR 3.5%→4.5%, same MaxDD).
+    Orders are queued DAY market orders for the same open as the SPY trade."""
+    if next_open <= now < next_close:
+        return                                        # only plan BIL moves outside the session
+    pos = {p.symbol: float(p.qty) for p in retry(tc.get_all_positions, "positions")}
+    cur = pos.get(CASH_ETF, 0.0)
+    tagp = f"rsi2-{next_day:%Y%m%d}-bil"
+    live = [o for o in orders_with_prefix(tc, tagp) if o.status.value not in ("rejected", "canceled", "expired")]
+    if live:
+        log.info("BIL order for %s already submitted — skip", next_day); return
+    acct = retry(tc.get_account, "account")
+    equity = float(acct.equity)
+    px = bil_close(data, signal_day)
+    target = 0 if hold_next else math.floor(equity * INVEST_FRACTION / px)
+    diff = target - cur
+    if abs(diff) * px < MIN_CASH_TRADE * equity:
+        log.info("BIL: hold %s (target %s) — no change", cur, target); return
+    side = OrderSide.BUY if diff > 0 else OrderSide.SELL
+    q = int(abs(diff))
+    tag = f"{tagp}-{side.value}"
+    try:
+        retry(lambda: tc.submit_order(MarketOrderRequest(symbol=CASH_ETF, qty=q, side=side,
+                                                         time_in_force=TimeInForce.DAY, client_order_id=tag)),
+              f"{side.value} BIL")
+    except APIError as e:
+        if "client_order_id" in str(e).lower():
+            return
+        notify.event("ORDER_REJECTED", f"RSI-2 {side.value} BIL x{q}: {e}", alert=True, color=notify.RED)
+        return
+    why = ("park idle cash in T-bills (BIL) so it earns interest" if side == OrderSide.BUY
+           else "free up the cash for the SPY trade")
+    notify.event("CASH_PARK", f"{side.value.upper()} {q} BIL at the {next_day:%a %d %b} open — {why}")
 
 
 if __name__ == "__main__":

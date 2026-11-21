@@ -233,7 +233,8 @@ def mode_trade(b: Broker) -> int:
             watch.append(s)
 
     if placed:
-        notify.discord("US ORB: entries armed", "\n".join(fmt(s) for s in placed), notify.GREEN)
+        notify.discord("US ORB: entries armed", "\n".join(fmt(s) for s in placed), notify.GREEN,
+                       plain=plain_armed(placed, today))
     if watch:
         watch_and_fire(b, watch, today)
     return 0
@@ -298,6 +299,28 @@ def flatten(b: Broker) -> list:
     return left
 
 
+def perth(t: time, d: date) -> str:
+    return datetime.combine(d, t, NY).astimezone(ZoneInfo("Australia/Perth")).strftime("%-I:%M%p").lower()
+
+
+def plain_armed(placed: list, today: date) -> str:
+    lines, worst, best = [], 0.0, 0.0
+    for s in placed:
+        risk = s.risk_ps * s.shares
+        gain = abs(s.target - s.level) * s.shares
+        worst += risk; best += gain
+        if s.side == 1:
+            lines.append(f"• **{s.symbol}**: if it rises to ${s.level:.2f}, the bot buys, betting it keeps going UP. "
+                         f"If wrong: lose about ${risk:.0f}. If right: make about ${gain:.0f}.")
+        else:
+            lines.append(f"• **{s.symbol}**: if it falls to ${s.level:.2f}, the bot bets it keeps going DOWN (short). "
+                         f"If wrong: lose about ${risk:.0f}. If right: make about ${gain:.0f}.")
+    return ("Tonight's plan:\n" + "\n".join(lines) +
+            f"\n\nNothing happens unless a price reaches its level. Orders not triggered by "
+            f"{perth(P.entry_deadline, today)} Perth time get cancelled. Anything still open is closed before the "
+            f"US close.\nWorst case tonight: about -${worst:.0f}. Best case: about +${best:.0f}.")
+
+
 def recap(b: Broker, today: date) -> None:
     acct = retry(b.trading.get_account, "account")
     pnl = float(acct.equity) - float(acct.last_equity)
@@ -331,7 +354,14 @@ def recap(b: Broker, today: date) -> None:
                          "backtest. Review before continuing.", alert=True, color=notify.RED)
     except Exception as e:
         log.warning("edge check failed: %s", e)
-    notify.discord(f"US ORB recap {today}", body, notify.GREEN if pnl >= 0 else notify.RED)
+    if not lines:
+        simple = f"No trades happened today, so ORB made $0. The account is at ${float(acct.equity):,.2f}."
+    else:
+        simple = (f"Today ORB {'made' if pnl >= 0 else 'lost'} **${abs(pnl):,.2f}** from {len(lines)} trade(s). "
+                  + " ".join(("✅ " if "TARGET" in l else "❌ " if "STOP" in l else "🔔 ") + l.split(':')[0]
+                             + (" hit its profit target." if "TARGET" in l else " hit its stop (small planned loss)."
+                                if "STOP" in l else " was closed at the end of the day.") for l in lines))
+    notify.discord(f"US ORB recap {today}", body, notify.GREEN if pnl >= 0 else notify.RED, plain=simple)
 
 
 def mode_eod(b: Broker) -> int:
