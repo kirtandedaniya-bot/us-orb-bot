@@ -22,7 +22,7 @@ load_dotenv()
 
 from orb import monitor, notify  # noqa: E402
 from orb.broker import Broker, retry  # noqa: E402
-from orb.strategy import Params, Setup, build_setup  # noqa: E402
+from orb.strategy import Params, Setup, budget_for, build_setup, explain_setup, setup_context  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orb")
@@ -67,6 +67,25 @@ def bracket(s: Setup, cid_: str, market: bool) -> MarketOrderRequest | StopOrder
 def fmt(s: Setup) -> str:
     return (f"**{s.symbol}** {'LONG' if s.side == 1 else 'SHORT'} x{s.shares} | trigger ${s.level:.2f} | "
             f"stop ${s.stop:.2f} | target ${s.target:.2f} | risk ${s.risk_ps * s.shares:.0f} | ATR% {s.atr_pct:.0f}")
+
+
+def detail(s: Setup) -> str:
+    """Full log line for a found setup (logs only)."""
+    trend = {1: "up", -1: "down", 2: "either"}.get(s.trend, s.trend)
+    return (f"{'LONG' if s.side == 1 else 'SHORT'} | trend {trend} | ATR% {s.atr_pct:.1f} | VWAP {s.vwap:.2f} | "
+            f"trigger {s.level:.2f} | stop {s.stop:.2f} | target {s.target:.2f} | risk/share {s.risk_ps:.2f} | "
+            f"shares {s.shares} | budget ${budget_for(s, P):.0f}")
+
+
+def mark_scanned(marker: str, now: datetime) -> None:
+    """Once-per-day marker (restored/saved by actions/cache in orb_trade.yml). Only silences the repeat
+    NO_SETUPS alert; duplicate ORDERS are prevented by the client_order_id check at Alpaca, not by this."""
+    if marker:
+        try:
+            with open(marker, "w") as f:
+                f.write(now.isoformat())
+        except OSError as e:
+            log.warning("could not write trade marker: %s", e)
 
 
 # ======================= TRADE =======================
@@ -126,9 +145,11 @@ def scan(b: Broker, today: date, symbols: list[str]) -> list[Setup]:
         if o.index[-1] < end - timedelta(minutes=5):
             notify.event("DATA_STALE", f"{sym}: last ORB bar {o.index[-1]:%H:%M}"); continue
         s = build_setup(sym, o, d, P)
-        log.info("%s -> %s", sym, fmt(s) if s else "no setup")
         if s:
+            log.info("%s -> SETUP %s", sym, detail(s))
             out.append(s)
+        else:
+            log.info("%s -> no setup: %s %s", sym, explain_setup(sym, o, d, P) or "?", setup_context(o, d, P))
     return out
 
 
@@ -194,10 +215,17 @@ def mode_trade(b: Broker) -> int:
                      alert=True, color=notify.RED)
     symbols = [s for s in UNIVERSE if s not in held]
 
+    marker = os.getenv("TRADE_MARKER", "")
+    alerted_today = bool(marker) and os.path.exists(marker)
+
     sleep_until(datetime.combine(today, time(10, 15, 5), NY))
     setups = scan(b, today, symbols)
     if not setups:
-        notify.event("NO_SETUPS", "No symbols passed V1 filters", alert=True, color=notify.GREY)
+        if alerted_today:
+            log.info("NO_SETUPS: No symbols passed V1 filters (Discord alert already sent today)")
+        else:
+            notify.event("NO_SETUPS", "No symbols passed V1 filters", alert=True, color=notify.GREY)
+        mark_scanned(marker, now_ny())
         return 0
 
     px = b.last_price([s.symbol for s in setups])
@@ -232,6 +260,7 @@ def mode_trade(b: Broker) -> int:
         elif r == "unsupported":
             watch.append(s)
 
+    mark_scanned(marker, now_ny())   # after scan + order placement (marker never gates orders)
     if placed:
         notify.discord("US ORB: entries armed", "\n".join(fmt(s) for s in placed), notify.GREEN,
                        plain=plain_armed(placed, today))
