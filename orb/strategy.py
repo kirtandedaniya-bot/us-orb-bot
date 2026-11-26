@@ -102,6 +102,79 @@ def build_setup(symbol: str, orb: pd.DataFrame, daily: pd.DataFrame, p: Params =
     return Setup(symbol, side, level, stop, target, r2(risk), shares, atr_pct, vwap, trend)
 
 
+# ---------- diagnostics only (logging). build_setup() above stays the single source of truth. ----------
+_TREND = {1: "up", -1: "down", 2: "either (no filter)", 0: "flat/unknown"}
+
+
+def _orb_stats(orb: pd.DataFrame) -> tuple[float, float, float, float]:
+    """(vwap, hi, lo, last) computed exactly as in build_setup."""
+    tp = (orb["high"] + orb["low"] + orb["close"]) / 3
+    vwap = float((tp * orb["volume"]).sum() / orb["volume"].sum())
+    return vwap, float(orb["high"].max()), float(orb["low"].min()), float(orb["close"].iloc[-1])
+
+
+def _bar_label(orb: pd.DataFrame) -> str:
+    ts = orb.index[-1]
+    return f"{ts:%H:%M} " if hasattr(ts, "strftime") else "last "
+
+
+def explain_setup(symbol: str, orb: pd.DataFrame, daily: pd.DataFrame, p: Params = Params()) -> str:
+    """Repeat build_setup()'s checks in the same order and return the FIRST one that failed,
+    with the numbers. Returns "" when build_setup() would return a Setup. Never used for trading."""
+    if len(orb) < p.min_orb_bars:
+        return f"too few ORB bars (n={len(orb)} < {p.min_orb_bars})"
+    if orb["volume"].sum() <= 0:
+        return "no ORB volume"
+    atr, trend = daily_context(daily, p.trend_len)
+    if trend == 0:
+        return f"trend flat/unknown ({len(daily)} daily bars)"
+    if not np.isfinite(atr) or atr <= 0:
+        return f"ATR unavailable ({atr})"
+    vwap, hi, lo, last = _orb_stats(orb)
+    atr_pct = (hi - lo) / atr * 100
+    if not (p.atr_lo <= atr_pct <= p.atr_hi):
+        return f"ATR% {atr_pct:.1f} outside {p.atr_lo:g}-{p.atr_hi:g}"
+    anchor = vwap if p.stop_mode == "vwap" else (hi + lo) / 2
+    bar = _bar_label(orb)
+    if trend in (1, 2) and last > vwap:
+        side, level, stop = 1, r2(hi), r2(anchor)
+    elif trend in (-1, 2) and last < vwap:
+        side, level, stop = -1, r2(lo), r2(anchor)
+    elif trend == 1:
+        return f"trend up but {bar}close {last:.2f} <= VWAP {vwap:.2f}"
+    elif trend == -1:
+        return f"trend down but {bar}close {last:.2f} >= VWAP {vwap:.2f}"
+    else:
+        return f"{bar}close {last:.2f} == VWAP {vwap:.2f}"
+    risk = side * (level - stop)
+    if risk <= p.min_risk_ps:
+        return f"risk/share {risk:.2f} <= {p.min_risk_ps:.2f}"
+    budget = p.risk_sweet if p.sweet_lo <= atr_pct <= p.sweet_hi else p.risk_base
+    shares = min(int(budget / risk), int(p.max_notional / level))
+    if shares < 1:
+        return (f"shares < 1 (budget ${budget:.0f} / risk {risk:.2f} = {int(budget / risk)}, "
+                f"notional cap {int(p.max_notional / level)})")
+    return ""
+
+
+def setup_context(orb: pd.DataFrame, daily: pd.DataFrame, p: Params = Params()) -> str:
+    """Short '(trend up, close 231.10, VWAP 231.45)' string for logs; tolerant of bad data."""
+    try:
+        _, trend = daily_context(daily, p.trend_len)
+        parts = [f"trend {_TREND.get(trend, trend)}"]
+        if len(orb) and orb["volume"].sum() > 0:
+            vwap, _, _, last = _orb_stats(orb)
+            parts += [f"close {last:.2f}", f"VWAP {vwap:.2f}"]
+        return "(" + ", ".join(parts) + ")"
+    except Exception as e:                       # logging must never break a scan
+        return f"(context unavailable: {e})"
+
+
+def budget_for(s: Setup, p: Params = Params()) -> float:
+    """$ risk budget build_setup() used for this setup."""
+    return p.risk_sweet if p.sweet_lo <= s.atr_pct <= p.sweet_hi else p.risk_base
+
+
 def simulate(s: Setup, post: pd.DataFrame, p: Params = Params(), slip: float = 0.01) -> Optional[dict]:
     """Bar-by-bar fill sim on 1-min bars from orb_end onward (index = timestamps, col 't' = time).
     Stop checked before target inside a bar (conservative)."""

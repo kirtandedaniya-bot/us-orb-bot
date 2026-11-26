@@ -24,6 +24,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - id: d
+        run: echo "day=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore once-per-day scan marker (silences repeat NO_SETUPS alerts only)
+        id: m
+        uses: actions/cache/restore@v4
+        with:
+          path: .trade_marker
+          key: orb-trade-${{ steps.d.outputs.day }}
       - name: Run
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -33,4 +41,12 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED || 'true' }}
           MAX_DRAWDOWN_USD: ${{ vars.MAX_DRAWDOWN_USD || '1000' }}
+          TRADE_MARKER: .trade_marker
         run: python bot.py trade
+      - name: Save scan marker
+        if: always() && steps.m.outputs.cache-hit != 'true' && hashFiles('.trade_marker') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .trade_marker
+          key: orb-trade-${{ steps.d.outputs.day }}
